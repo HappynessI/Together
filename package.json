@@ -1,0 +1,21 @@
+{
+  "name": "pair-journal-shared",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "vercel dev",
+    "hash-password": "node scripts/hash-password.mjs",
+    "check": "node --check app.js && node --check lib/server.js && node --check api/login.js && node --check api/bootstrap.js && node --check api/command.js && node --check api/logout.js && node --check api/media.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.55.0",
+    "bcryptjs": "^3.0.2"
+  },
+  "devDependencies": {
+    "vercel": "^58.9.0"
+  }
+}

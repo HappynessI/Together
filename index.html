@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#fdf6e3">
+  <title>并肩 · 双人生活打卡</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div id="ambient" aria-hidden="true"></div>
+
+  <main id="login-screen" class="login-screen">
+    <section class="login-panel" aria-labelledby="login-title">
+      <div class="brand-mark" aria-hidden="true">✦</div>
+      <p class="eyebrow">PAIR JOURNAL</p>
+      <h1 id="login-title">并肩</h1>
+      <p class="login-intro">把认真生活的痕迹，留给彼此看见。</p>
+
+      <form id="login-form" class="login-form" autocomplete="off">
+        <label for="password">输入你的专属密码</label>
+        <div class="password-row">
+          <input id="password" name="password" type="password" placeholder="密码会自动识别身份" required autofocus>
+          <button type="submit" class="primary-button">进入日记 <span aria-hidden="true">→</span></button>
+        </div>
+        <p id="login-error" class="form-error" role="alert"></p>
+      </form>
+
+      <div id="local-demo-note" class="demo-note">
+        <span>仅本机预览密码</span>
+        <code>我：solarized</code>
+        <code>搭档：bluebird</code>
+      </div>
+    </section>
+
+    <aside class="login-preview" aria-label="产品预览">
+      <div class="preview-date">
+        <span>本周同频</span>
+        <strong id="login-week-range">8.10—8.16</strong>
+      </div>
+      <div class="preview-progress">
+        <div>
+          <small>距离下一颗 Star</small>
+          <strong>78<span>/100</span></strong>
+        </div>
+        <span class="preview-star" aria-hidden="true">★</span>
+      </div>
+      <div class="preview-grid" id="login-preview-grid" aria-hidden="true"></div>
+      <blockquote>“今天推进了 B 阶段训练，也记得出去走了一圈。”</blockquote>
+      <div class="preview-people">
+        <span class="mini-avatar avatar-me">我</span>
+        <div class="connection-line"><span></span></div>
+        <span class="mini-avatar avatar-a">友</span>
+      </div>
+    </aside>
+  </main>
+
+  <div id="app-shell" class="app-shell is-hidden">
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <span class="small-brand-mark">✦</span>
+        <span>并肩</span>
+      </div>
+
+      <nav class="main-nav" aria-label="主导航">
+        <button type="button" class="nav-item is-active" data-view="today">
+          <span class="nav-icon" aria-hidden="true">⌁</span><span>今天</span>
+        </button>
+        <button type="button" class="nav-item" data-view="timeline">
+          <span class="nav-icon" aria-hidden="true">◫</span><span>时间线</span>
+        </button>
+        <button type="button" class="nav-item" data-view="insights">
+          <span class="nav-icon" aria-hidden="true">▦</span><span>周报</span>
+        </button>
+        <button type="button" class="nav-item" data-view="stars">
+          <span class="nav-icon" aria-hidden="true">★</span><span>Stars</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <button id="settings-button" type="button" class="profile-button" aria-label="打开个性设置">
+          <span id="sidebar-avatar" class="avatar">我</span>
+          <span class="profile-copy"><strong id="sidebar-name">我</strong><small>个性设置</small></span>
+          <span aria-hidden="true">···</span>
+        </button>
+        <button id="logout-button" type="button" class="text-button">退出空间</button>
+      </div>
+    </aside>
+
+    <section class="workspace">
+      <header class="topbar">
+        <div>
+          <p id="space-kicker" class="eyebrow">我们的日常</p>
+          <h2 id="view-title">今天，继续并肩</h2>
+        </div>
+        <div class="topbar-actions">
+          <button id="mobile-settings-button" type="button" class="mobile-profile-button" aria-label="打开个性设置"><span id="topbar-avatar" class="avatar"></span></button>
+          <span id="today-label" class="date-chip"></span>
+          <button id="theme-toggle" type="button" class="icon-button" aria-label="切换明暗主题">◐</button>
+        </div>
+      </header>
+
+      <div id="view-today" class="view is-active">
+        <section id="pair-summary" class="pair-summary" aria-label="双方进度"></section>
+
+        <section class="score-rubric" aria-label="每日评分标准">
+          <div class="score-rubric-title"><strong>评分标准</strong><small>两个维度分别自评</small></div>
+          <div class="score-rubric-scale">
+            <span><b>0</b><small>未进行</small></span>
+            <span><b>1</b><small>有所接触</small></span>
+            <span><b>2</b><small>完成小目标</small></span>
+            <span><b>3</b><small>完成主要计划</small></span>
+            <span><b>4</b><small>明显进展</small></span>
+            <span><b>5</b><small>里程碑</small></span>
+          </div>
+        </section>
+
+        <section class="today-grid">
+          <article class="journal-panel editor-panel">
+            <header class="journal-header">
+              <div class="person-line">
+                <span id="editor-avatar" class="avatar"></span>
+                <div><strong id="editor-name"></strong><small>正在记录今天</small></div>
+              </div>
+              <div class="editor-header-actions">
+                <div id="editor-mode-toggle" class="editor-mode-toggle" aria-label="切换编辑或预览">
+                  <button type="button" class="is-active" data-mode="edit" aria-pressed="true">编辑</button>
+                  <button type="button" data-mode="preview" aria-pressed="false">预览</button>
+                </div>
+                <span class="status-dot"><i></i> 自动保存草稿</span>
+              </div>
+            </header>
+
+            <div id="editor-compose">
+              <div class="track-editor growth-track">
+                <div class="track-heading">
+                  <div><span class="track-dot"></span><strong>学习与工作</strong></div>
+                  <div id="growth-score" class="score-picker" role="group" aria-label="学习工作评分"></div>
+                </div>
+                <textarea id="growth-text" rows="8" placeholder="支持 Markdown，例如：&#10;### Prefix-GRPO&#10;- [x] 查看运行结果&#10;- [ ] 开启下一轮验证"></textarea>
+              </div>
+
+              <div class="track-editor life-track">
+                <div class="track-heading">
+                  <div><span class="track-dot"></span><strong>生活与娱乐</strong></div>
+                  <div id="life-score" class="score-picker" role="group" aria-label="生活娱乐评分"></div>
+                </div>
+                <textarea id="life-text" rows="5" placeholder="散步、电影、运动，或任何值得留下的小事……"></textarea>
+              </div>
+            </div>
+
+            <div id="editor-preview" class="rendered-journal editor-preview is-hidden" aria-live="polite"></div>
+
+            <div class="editor-footer">
+              <span class="markdown-hint">支持标题、复选框和 <code>命令</code>，点击“预览”查看排版</span>
+              <button id="save-log" type="button" class="primary-button">保存今日记录</button>
+            </div>
+          </article>
+
+          <article class="journal-panel partner-panel">
+            <header class="journal-header">
+              <div class="person-line">
+                <span id="partner-avatar" class="avatar"></span>
+                <div><strong id="partner-name"></strong><small id="partner-update">今天还没有记录</small></div>
+              </div>
+              <button id="reaction-button" type="button" class="reaction-button" aria-label="给对方回应">♡ <span id="reaction-count">0</span></button>
+            </header>
+            <div id="partner-content" class="rendered-journal empty-journal"></div>
+          </article>
+        </section>
+      </div>
+
+      <div id="view-timeline" class="view">
+        <section class="section-heading">
+          <div><p class="eyebrow">SHARED DAYS</p><h3>我们的时间线</h3></div>
+          <div class="segmented-control" id="timeline-filter" aria-label="筛选时间线">
+            <button type="button" class="is-active" data-filter="all">全部</button>
+            <button type="button" data-filter="growth">学习工作</button>
+            <button type="button" data-filter="life">生活娱乐</button>
+          </div>
+        </section>
+        <div id="timeline-list" class="timeline-list"></div>
+      </div>
+
+      <div id="view-insights" class="view">
+        <section class="section-heading insights-heading">
+          <div><p class="eyebrow">WEEKLY INSIGHTS</p><h3>看见持续发生的变化</h3></div>
+          <div id="insight-person-tabs" class="person-tabs" aria-label="选择成员"></div>
+        </section>
+        <section id="insight-stats" class="stat-grid"></section>
+        <section class="heatmap-section">
+          <article class="heatmap-panel">
+            <header><div><span class="track-dot growth"></span><strong>学习与工作</strong></div><small>最近 16 周</small></header>
+            <div id="growth-heatmap" class="heatmap-wrap"></div>
+            <div class="heatmap-legend"><span>少</span><i data-level="0"></i><i data-level="1"></i><i data-level="2"></i><i data-level="3"></i><i data-level="4"></i><i data-level="5"></i><span>多</span></div>
+          </article>
+          <article class="heatmap-panel">
+            <header><div><span class="track-dot life"></span><strong>生活与娱乐</strong></div><small>最近 16 周</small></header>
+            <div id="life-heatmap" class="heatmap-wrap life-map"></div>
+            <div class="heatmap-legend life-legend"><span>少</span><i data-level="0"></i><i data-level="1"></i><i data-level="2"></i><i data-level="3"></i><i data-level="4"></i><i data-level="5"></i><span>多</span></div>
+          </article>
+        </section>
+        <section class="weekly-panel">
+          <header>
+            <div><p class="eyebrow">THIS WEEK</p><h3>本周节奏</h3></div>
+            <div class="weekly-meta">
+              <div class="weekly-legend" aria-label="图例"><span><i class="growth"></i>学习工作</span><span><i class="life"></i>生活娱乐</span></div>
+              <p id="weekly-caption"></p>
+            </div>
+          </header>
+          <div id="weekly-chart" class="weekly-chart"></div>
+        </section>
+      </div>
+
+      <div id="view-stars" class="view">
+        <section class="section-heading">
+          <div><p class="eyebrow">RELATIONSHIP TOKENS</p><h3>每颗 Star，只属于这段关系</h3></div>
+        </section>
+        <section id="wallet-grid" class="wallet-grid"></section>
+        <section class="star-layout">
+          <article class="wish-composer">
+            <p class="eyebrow">USE A STAR</p>
+            <h3>想让对方做一件什么小事？</h3>
+            <p class="composer-copy">消耗 1 颗 Star，向对方提出一个小愿望。</p>
+            <form id="wish-form">
+              <label for="wish-text">愿望内容</label>
+              <textarea id="wish-text" rows="4" placeholder="例如：这周陪我散步一小时"></textarea>
+              <button type="submit" class="primary-button">使用 1 ★ 发出愿望</button>
+              <p id="wish-error" class="form-error" role="alert"></p>
+            </form>
+          </article>
+          <article class="wish-list-panel">
+            <header><div><p class="eyebrow">WISH BOARD</p><h3>愿望清单</h3></div></header>
+            <div id="wish-list" class="wish-list"></div>
+          </article>
+        </section>
+      </div>
+    </section>
+
+    <nav class="mobile-nav" aria-label="移动端导航">
+      <button type="button" class="is-active" data-view="today"><span>⌁</span>今天</button>
+      <button type="button" data-view="timeline"><span>◫</span>时间线</button>
+      <button type="button" data-view="insights"><span>▦</span>周报</button>
+      <button type="button" data-view="stars"><span>★</span>Stars</button>
+    </nav>
+  </div>
+
+  <dialog id="settings-dialog" class="settings-dialog">
+    <form method="dialog" class="dialog-card">
+      <header><div><p class="eyebrow">PERSONALIZE</p><h3>让空间更像你们</h3></div><button value="cancel" class="icon-button" aria-label="关闭">×</button></header>
+      <div class="setting-row name-setting-row">
+        <div><strong>我的名字</strong><small>会同步给对方，最多 16 字</small></div>
+        <div class="name-setting-control">
+          <input id="display-name" class="name-input" type="text" maxlength="16" autocomplete="nickname" placeholder="给自己起个名字" aria-describedby="display-name-error">
+          <button id="save-display-name" type="button" class="secondary-button">保存名字</button>
+          <small id="display-name-error" class="form-error" role="alert"></small>
+        </div>
+      </div>
+      <div class="setting-row">
+        <div><strong>我的头像</strong><small>支持 JPG、PNG，云端模式会同步给对方</small></div>
+        <label class="upload-button" for="avatar-image">选择图片</label>
+        <input id="avatar-image" type="file" accept="image/*" hidden>
+      </div>
+      <div class="setting-row">
+        <div><strong>空间背景</strong><small>图片会自动覆盖柔和遮罩</small></div>
+        <label class="upload-button" for="background-image">选择图片</label>
+        <input id="background-image" type="file" accept="image/*" hidden>
+      </div>
+      <div class="setting-row">
+        <div><strong>Solarized 主题</strong><small>明亮纸张感或安静深色</small></div>
+        <button id="dialog-theme-toggle" type="button" class="secondary-button">切换明暗</button>
+      </div>
+      <footer>
+        <button id="clear-background" type="button" class="text-button">移除背景图</button>
+        <button id="dialog-logout-button" type="button" class="text-button">切换身份</button>
+        <button value="done" class="primary-button">完成</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="./app.js"></script>
+</body>
+</html>
