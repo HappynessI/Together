@@ -43,6 +43,10 @@ create table if not exists public.wallets (
   -- Cached projection. The RPCs recalculate these values from logs/wishes;
   -- they are never accepted from the browser.
   lifetime_points bigint not null default 0 check (lifetime_points >= 0),
+  -- Opening balances import score/Star history without fabricating old logs
+  -- or placeholder wishes. New activity is added on top of these baselines.
+  opening_lifetime_points bigint not null default 0 check (opening_lifetime_points >= 0),
+  opening_spent_stars integer not null default 0 check (opening_spent_stars >= 0),
   points integer not null default 0 check (points between 0 and 99),
   stars integer not null default 0 check (stars >= 0),
   updated_at timestamptz not null default now(),
@@ -50,6 +54,8 @@ create table if not exists public.wallets (
 );
 
 alter table public.wallets add column if not exists lifetime_points bigint not null default 0;
+alter table public.wallets add column if not exists opening_lifetime_points bigint not null default 0;
+alter table public.wallets add column if not exists opening_spent_stars integer not null default 0;
 
 create table if not exists public.wishes (
   id uuid primary key default gen_random_uuid(),
@@ -140,18 +146,27 @@ drop view if exists public.wallet_summary;
 create or replace view public.wallet_summary
 with (security_invoker = true)
 as
-with totals as (
+with log_totals as (
   select role_id,
-         coalesce(sum(growth_score + life_score), 0)::bigint as lifetime_points
+         coalesce(sum(growth_score + life_score), 0)::bigint as logged_points
   from public.daily_logs
   where room_id = 'pair'
   group by role_id
-), spent as (
+), wish_totals as (
   select from_role_id as role_id,
-         coalesce(sum(cost), 0)::bigint as spent_stars
+         coalesce(sum(cost), 0)::bigint as wished_stars
   from public.wishes
   where room_id = 'pair'
   group by from_role_id
+), totals as (
+  select
+    p.id as role_id,
+    (coalesce(w.opening_lifetime_points, 0) + coalesce(l.logged_points, 0))::bigint as lifetime_points,
+    (coalesce(w.opening_spent_stars, 0) + coalesce(x.wished_stars, 0))::bigint as spent_stars
+  from public.profiles p
+  left join public.wallets w on w.room_id = 'pair' and w.role_id = p.id
+  left join log_totals l on l.role_id = p.id
+  left join wish_totals x on x.role_id = p.id
 )
 select
   p.id as role_id,
@@ -159,15 +174,14 @@ select
   coalesce(t.lifetime_points, 0)::bigint as lifetime_points,
   mod(coalesce(t.lifetime_points, 0), 100)::integer as points,
   floor(coalesce(t.lifetime_points, 0) / 100.0)::bigint as earned_stars,
-  coalesce(s.spent_stars, 0)::bigint as spent_stars,
+  coalesce(t.spent_stars, 0)::bigint as spent_stars,
   greatest(
-    floor(coalesce(t.lifetime_points, 0) / 100.0)::bigint - coalesce(s.spent_stars, 0),
+    floor(coalesce(t.lifetime_points, 0) / 100.0)::bigint - coalesce(t.spent_stars, 0),
     0
   )::integer as stars,
   (100 - mod(coalesce(t.lifetime_points, 0), 100))::integer as points_to_next_star
 from public.profiles p
-left join totals t on t.role_id = p.id
-left join spent s on s.role_id = p.id;
+left join totals t on t.role_id = p.id;
 
 -- Save/edit a log and reconcile the wallet in one transaction.  The advisory
 -- lock is per member, so saving two different dates cannot lose points.
@@ -228,12 +242,20 @@ begin
     life_score = excluded.life_score,
     images = excluded.images;
 
-  select coalesce(sum(growth_score + life_score), 0)::bigint
+  select (
+      coalesce((select opening_lifetime_points from public.wallets
+        where room_id = p_room_id and role_id = p_role_id), 0)
+      + coalesce(sum(growth_score + life_score), 0)
+    )::bigint
     into v_total
   from public.daily_logs
   where room_id = p_room_id and role_id = p_role_id;
   select floor(v_total / 100.0)::bigint into v_earned;
-  select coalesce(sum(cost), 0)::bigint into v_spent
+  select (
+      coalesce((select opening_spent_stars from public.wallets
+        where room_id = p_room_id and role_id = p_role_id), 0)
+      + coalesce(sum(cost), 0)
+    )::bigint into v_spent
   from public.wishes
   where room_id = p_room_id and from_role_id = p_role_id;
   if v_earned < v_spent then
@@ -287,10 +309,18 @@ begin
   end if;
 
   perform pg_advisory_xact_lock(hashtextextended('wallet|' || p_room_id || '|' || p_from_role_id, 0));
-  select coalesce(sum(growth_score + life_score), 0)::bigint into v_total
+  select (
+      coalesce((select opening_lifetime_points from public.wallets
+        where room_id = p_room_id and role_id = p_from_role_id), 0)
+      + coalesce(sum(growth_score + life_score), 0)
+    )::bigint into v_total
   from public.daily_logs where room_id = p_room_id and role_id = p_from_role_id;
   v_earned := floor(v_total / 100.0)::bigint;
-  select coalesce(sum(cost), 0)::bigint into v_spent
+  select (
+      coalesce((select opening_spent_stars from public.wallets
+        where room_id = p_room_id and role_id = p_from_role_id), 0)
+      + coalesce(sum(cost), 0)
+    )::bigint into v_spent
   from public.wishes where room_id = p_room_id and from_role_id = p_from_role_id;
   if v_earned - v_spent < 1 then
     raise exception 'insufficient_stars';

@@ -324,7 +324,8 @@ textarea::placeholder, input::placeholder { color: var(--faint); }
 .progress-track { height: 6px; overflow: hidden; border-radius: 99px; background: var(--surface-deep); }
 .progress-track i { display: block; height: 100%; border-radius: inherit; background: var(--cyan); }
 .progress-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
-.progress-meta strong { color: var(--yellow); font-family: Georgia, serif; font-size: 20px; }
+.progress-meta strong { display: flex; gap: 6px; color: var(--yellow); font-family: Georgia, serif; font-size: 17px; white-space: nowrap; }
+.progress-meta strong .spent-count { color: var(--muted); }
 .progress-meta small { color: var(--muted); }
 
 .score-rubric { display: flex; align-items: center; gap: 22px; margin-bottom: 18px; padding: 10px 14px; border: 1px solid var(--border); border-radius: 14px; background: color-mix(in srgb, var(--surface) 72%, transparent); }
@@ -482,6 +483,12 @@ textarea::placeholder, input::placeholder { color: var(--faint); }
 .wallet-copy span { color: var(--muted); font-size: 12px; }
 .wallet-copy strong { color: var(--yellow); }
 .wallet-copy small { display: block; margin-top: 7px; color: var(--muted); }
+.star-strip { display: inline-flex; flex: 0 0 auto; align-items: center; font-family: Georgia, serif; font-size: 19px; letter-spacing: 1px; line-height: 1; white-space: nowrap; }
+.star-strip i { font-style: normal; }
+.star-strip .spent-stars { color: var(--cyan); }
+.star-strip .available-stars { color: var(--yellow); }
+.wallet-copy .wallet-ledger { display: flex; flex-wrap: wrap; justify-content: flex-start; gap: 5px 12px; margin-top: 9px; }
+.wallet-copy .wallet-ledger span { color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; }
 
 .star-layout { display: grid; grid-template-columns: minmax(280px, .75fr) minmax(0, 1.25fr); gap: 16px; }
 .wish-composer, .wish-list-panel { padding: 22px; }
@@ -552,6 +559,8 @@ textarea::placeholder, input::placeholder { color: var(--faint); }
   .topbar h2 { font-size: 21px; }
   .date-chip { display: none; }
   .pair-summary, .wallet-grid { grid-template-columns: 1fr; }
+  .wallet-card { align-items: flex-start; padding: 17px; }
+  .wallet-copy > div:first-child { align-items: flex-start; flex-direction: column; gap: 8px; }
   .score-rubric-scale { grid-template-columns: repeat(3, minmax(0, 1fr)); width: 100%; }
   .journal-panel { padding: 15px; border-radius: 20px; }
   .status-dot { display: none; }

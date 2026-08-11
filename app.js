@@ -89,8 +89,8 @@
       logs: {},
       drafts: {},
       wallets: {
-        "pair|me": { points: 78, stars: 1 },
-        "pair|partner": { points: 42, stars: 1 }
+        "pair|me": { lifetimePoints: 278, points: 78, earnedStars: 2, spentStars: 1, stars: 1 },
+        "pair|partner": { lifetimePoints: 242, points: 42, earnedStars: 2, spentStars: 1, stars: 1 }
       },
       wishes: [
         { id: "wish-1", roomId: "pair", from: "partner", to: "me", text: "一起去喝那家新开的咖啡", status: "done", createdAt: localISO(addDays(now, -8)) },
@@ -168,8 +168,8 @@
 
     sampleDays.forEach((sample, index) => {
       const date = localISO(addDays(now, sample.offset));
-      const meScore = Math.max(2, 4 - (index % 2));
-      const lifeScore = 2 + (index % 2);
+      const meScore = sample.meGrowthScore ?? Math.max(2, 4 - (index % 2));
+      const lifeScore = sample.meLifeScore ?? (2 + (index % 2));
       state.logs[logKey("pair", "me", date)] = {
         growthText: sample.meGrowth,
         lifeText: sample.meLife,
@@ -181,8 +181,8 @@
       state.logs[logKey("pair", "partner", date)] = {
         growthText: sample.partnerGrowth,
         lifeText: sample.partnerLife,
-        growthScore: 2 + ((index + 1) % 3),
-        lifeScore: 2 + (index % 3),
+        growthScore: sample.partnerGrowthScore ?? (2 + ((index + 1) % 3)),
+        lifeScore: sample.partnerLifeScore ?? (2 + (index % 3)),
         images: [],
         updatedAt: "21:04"
       };
@@ -243,6 +243,11 @@
   let cloudSession = false;
   let refreshTimer = null;
   let remoteRefreshInFlight = false;
+  let mutationEpoch = 0;
+  let activeMutations = 0;
+  let draftRevision = 0;
+  let lastRemoteRefreshAt = 0;
+  let appliedBackgroundSource = null;
 
   // The local snapshot is useful for the offline prototype, but must never be
   // treated as an authentication mechanism on a deployed site.  Only the
@@ -274,13 +279,73 @@
     return body;
   }
 
+  function mediaIdentity(value) {
+    const source = String(value || "");
+    if (!source || source.startsWith("data:") || source.startsWith("blob:")) return source;
+    try {
+      const url = new URL(source, window.location.href);
+      return `${url.origin}${url.pathname}`;
+    } catch {
+      return source.split("?")[0];
+    }
+  }
+
+  function canonicalValue(value) {
+    if (Array.isArray(value)) return value.map(canonicalValue);
+    if (!value || typeof value !== "object") return value;
+    return Object.keys(value).sort().reduce((result, key) => {
+      result[key] = canonicalValue(value[key]);
+      return result;
+    }, {});
+  }
+
+  function remoteStateFingerprint(source) {
+    const roles = Object.fromEntries(Object.entries(source?.roles || {}).map(([roleId, role]) => [
+      roleId,
+      { ...role, avatar: mediaIdentity(role?.avatar) },
+    ]));
+    const backgrounds = Object.fromEntries(Object.entries(source?.backgrounds || {}).map(([roleId, background]) => [
+      roleId,
+      mediaIdentity(background),
+    ]));
+    const logs = Object.fromEntries(Object.entries(source?.logs || {}).map(([key, log]) => [
+      key,
+      { ...log, images: (log?.images || []).map(mediaIdentity) },
+    ]));
+    return JSON.stringify(canonicalValue({
+      version: source?.version,
+      theme: source?.theme,
+      roles,
+      rooms: source?.rooms || {},
+      logs,
+      wallets: source?.wallets || {},
+      wishes: source?.wishes || [],
+      reactions: source?.reactions || {},
+      backgrounds,
+    }));
+  }
+
+  function keepStableMediaUrl(previous, next) {
+    return previous && mediaIdentity(previous) === mediaIdentity(next) ? previous : (next || "");
+  }
+
   function mergeRemoteState(remote, roleId = state.sessionRole) {
     if (!remote || typeof remote !== "object") return false;
     const localDrafts = state?.drafts || {};
+    const roles = Object.fromEntries(Object.entries(remote.roles || {}).map(([id, role]) => [
+      id,
+      { ...role, avatar: keepStableMediaUrl(state?.roles?.[id]?.avatar, role?.avatar) },
+    ]));
+    const backgrounds = Object.fromEntries(Object.entries(remote.backgrounds || {}).map(([id, background]) => [
+      id,
+      keepStableMediaUrl(state?.backgrounds?.[id], background),
+    ]));
     state = {
       ...remote,
+      roles,
+      backgrounds,
       theme: remote.theme === "dark" ? "dark" : remote.theme === "light" ? "light" : (state?.theme || "light"),
-      drafts: { ...localDrafts, ...(remote.drafts || {}) },
+      drafts: { ...(remote.drafts || {}), ...localDrafts },
       sessionRole: roleId || remote.sessionRole,
     };
     applyTheme();
@@ -289,13 +354,6 @@
 
   function isNetworkFailure(error) {
     return !(error instanceof ApiError) || !error.status || error.status >= 500;
-  }
-
-  function isEditorFocused() {
-    const active = document.activeElement;
-    return active?.id === "growth-text"
-      || active?.id === "life-text"
-      || Boolean(active?.closest?.("#editor-compose"));
   }
 
   function hasUnsavedTodayDraft() {
@@ -311,47 +369,56 @@
       });
   }
 
-  // Polling should keep the partner's view current without replacing a
-  // textarea that the current user is typing in.  A full render replaces the
-  // textarea nodes, which moves the caret (and can look like a page refresh).
-  function renderRemoteWhileEditing() {
+  // A background refresh only redraws the active view. It never rebuilds all
+  // views, and it leaves the editor controls untouched unless this user's own
+  // saved log genuinely changed on another device.
+  function renderRemoteStateChange({ updateEditor = false } = {}) {
     renderChrome();
-    renderPairSummary();
-    renderEditorIdentity();
-    renderPartnerPanel();
-    if (currentView === "timeline") renderTimeline();
-    if (currentView === "insights") renderInsights();
-    if (currentView === "stars") renderStars();
+    if (currentView === "today") {
+      if (updateEditor) loadTodayDraft();
+      renderToday({ preserveEditor: !updateEditor });
+    } else if (currentView === "timeline") {
+      renderTimeline();
+    } else if (currentView === "insights") {
+      renderInsights();
+    } else if (currentView === "stars") {
+      renderStars();
+    }
     applyBackground();
   }
 
   async function refreshRemote({ silent = true } = {}) {
-    if (!cloudSession || remoteRefreshInFlight) return false;
+    if (!cloudSession || remoteRefreshInFlight || activeMutations > 0 || document.visibilityState === "hidden") return false;
     remoteRefreshInFlight = true;
-    // Preserve the in-memory keystrokes even if the 350ms local draft timer
-    // has not fired before a poll/focus refresh starts.
-    if (state.sessionRole && draft) {
-      const key = logKey(currentRoomId(), state.sessionRole, localISO());
-      const saved = state.logs[key] || emptyLog();
-      const changed = ["growthText", "lifeText", "growthScore", "lifeScore", "images"]
-        .some((field) => field === "images"
-          ? JSON.stringify(draft.images || []) !== JSON.stringify(saved.images || [])
-          : (draft[field] || 0) !== (saved[field] || 0));
-      if (changed) state.drafts[key] = clone(draft);
-    }
+    const requestMutationEpoch = mutationEpoch;
+    const requestDraftRevision = draftRevision;
+    const roleId = state.sessionRole;
+    const todayKey = roleId ? logKey(currentRoomId(), roleId, localISO()) : "";
+    const ownLogBefore = todayKey ? clone(state.logs[todayKey] || emptyLog()) : emptyLog();
+    const hadUnsavedDraft = hasUnsavedTodayDraft();
+    const draftBeforeRequest = hadUnsavedDraft ? clone(draft) : null;
     try {
       const response = await apiRequest("/api/bootstrap", { method: "GET", headers: {} });
-      mergeRemoteState(response.state, response.role || response.roleId || state.sessionRole);
-      // Typing can continue while the request is in flight. Preserve that
-      // latest in-memory draft against the freshly fetched log as well.
-      if (state.sessionRole && draft && hasUnsavedTodayDraft()) {
-        state.drafts[logKey(currentRoomId(), state.sessionRole, localISO())] = clone(draft);
+      lastRemoteRefreshAt = Date.now();
+      // A command that started after this poll owns the newer state. Discard
+      // the older bootstrap response instead of letting it jump the UI back.
+      if (requestMutationEpoch !== mutationEpoch) return false;
+
+      const typedDuringRequest = requestDraftRevision !== draftRevision;
+      const localDraftToKeep = typedDuringRequest ? clone(draft) : draftBeforeRequest;
+      const remoteChanged = remoteStateFingerprint(state) !== remoteStateFingerprint(response.state);
+      if (!remoteChanged) {
+        if (todayKey && localDraftToKeep) state.drafts[todayKey] = localDraftToKeep;
+        return true;
       }
+
+      const ownLogAfter = todayKey ? clone(response.state?.logs?.[todayKey] || emptyLog()) : emptyLog();
+      const ownSavedLogChanged = JSON.stringify(canonicalValue(ownLogBefore)) !== JSON.stringify(canonicalValue(ownLogAfter));
+      mergeRemoteState(response.state, response.role || response.roleId || roleId);
+      if (todayKey && localDraftToKeep) state.drafts[todayKey] = localDraftToKeep;
+      else if (todayKey) delete state.drafts[todayKey];
       persist();
-      const preserveEditor = currentView === "today"
-        && (isEditorFocused() || editorMode === "preview" || hasUnsavedTodayDraft());
-      if (preserveEditor) renderRemoteWhileEditing();
-      else renderApp();
+      renderRemoteStateChange({ updateEditor: ownSavedLogChanged && !localDraftToKeep });
       return true;
     } catch (error) {
       if (error.status === 401) {
@@ -367,7 +434,9 @@
 
   function startRemoteRefresh() {
     stopRemoteRefresh();
-    refreshTimer = window.setInterval(() => refreshRemote(), 20000);
+    refreshTimer = window.setInterval(() => {
+      if (document.visibilityState === "visible") refreshRemote();
+    }, 20000);
   }
 
   function stopRemoteRefresh() {
@@ -377,13 +446,17 @@
 
   async function sendCommand(type, payload, { silent = false } = {}) {
     if (!cloudSession) return null;
+    const commandEpoch = ++mutationEpoch;
+    activeMutations += 1;
     try {
       const response = await apiRequest("/api/command", {
         method: "POST",
         body: JSON.stringify({ type, payload }),
       });
-      mergeRemoteState(response.state, state.sessionRole);
-      persist();
+      if (commandEpoch === mutationEpoch) {
+        mergeRemoteState(response.state, state.sessionRole);
+        persist();
+      }
       return response;
     } catch (error) {
       // A failed cloud command must not silently mutate a stale local copy.
@@ -395,6 +468,8 @@
       }
       if (!silent) showToast(error.message || "同步失败，请稍后重试");
       return null;
+    } finally {
+      activeMutations = Math.max(0, activeMutations - 1);
     }
   }
 
@@ -433,10 +508,46 @@
     return state.logs[logKey(roomId, roleId, date)] || emptyLog();
   }
 
+  function normalizeWallet(value = {}) {
+    const points = Math.max(0, Math.min(99, Number(value.points || 0)));
+    const explicitLifetime = Number(value.lifetimePoints);
+    const explicitEarned = Number(value.earnedStars);
+    const explicitSpent = Number(value.spentStars);
+    const explicitAvailable = Number(value.stars);
+    let earnedStars = Number.isFinite(explicitLifetime)
+      ? Math.floor(Math.max(0, explicitLifetime) / 100)
+      : Number.isFinite(explicitEarned) ? Math.max(0, Math.floor(explicitEarned)) : 0;
+    let availableStars = Number.isFinite(explicitAvailable) ? Math.max(0, Math.floor(explicitAvailable)) : 0;
+    let spentStars = Number.isFinite(explicitSpent)
+      ? Math.max(0, Math.floor(explicitSpent))
+      : Math.max(0, earnedStars - availableStars);
+    earnedStars = Math.max(earnedStars, spentStars + availableStars);
+    if (!Number.isFinite(explicitAvailable)) availableStars = Math.max(0, earnedStars - spentStars);
+    const lifetimePoints = Number.isFinite(explicitLifetime)
+      ? Math.max(0, Math.floor(explicitLifetime))
+      : earnedStars * 100 + points;
+    return {
+      ...value,
+      lifetimePoints,
+      points,
+      earnedStars,
+      spentStars,
+      stars: availableStars,
+      pointsToNextStar: points === 0 ? 100 : 100 - points,
+    };
+  }
+
   function getWallet(roomId, roleId) {
     const key = walletKey(roomId, roleId);
-    if (!state.wallets[key]) state.wallets[key] = { points: 0, stars: 0 };
+    state.wallets[key] = normalizeWallet(state.wallets[key]);
     return state.wallets[key];
+  }
+
+  function renderStarStrip(wallet) {
+    const spent = "☆".repeat(Math.min(wallet.spentStars, 20));
+    const available = "★".repeat(Math.min(wallet.stars, 20));
+    const overflow = wallet.earnedStars > 20 ? "…" : "";
+    return `<span class="star-strip" role="img" aria-label="已使用 ${wallet.spentStars} 颗，可用 ${wallet.stars} 颗"><i class="spent-stars">${spent}</i><i class="available-stars">${available}</i>${overflow}</span>`;
   }
 
   function setAvatar(element, roleId) {
@@ -559,7 +670,10 @@
     currentView = "today";
     insightPerson = roleId;
     renderApp();
-    if (cloudSession) startRemoteRefresh();
+    if (cloudSession) {
+      lastRemoteRefreshAt = Date.now();
+      startRemoteRefresh();
+    }
   }
 
   async function login(roleId) {
@@ -709,6 +823,7 @@
     container.innerHTML = orderedMembers.map((roleId) => {
       const role = state.roles[roleId];
       const wallet = getWallet(room.id, roleId);
+      const spentMeta = wallet.spentStars ? `<span class="spent-count">☆${wallet.spentStars}</span>` : "";
       return `
         <article class="progress-card">
           <span class="avatar" data-avatar="${roleId}"></span>
@@ -716,7 +831,7 @@
             <div><strong>${escapeHTML(role.name)}</strong><span>${wallet.points}/100</span></div>
             <div class="progress-track"><i style="width:${wallet.points}%"></i></div>
           </div>
-          <div class="progress-meta"><strong>${wallet.stars} ★</strong><small>可用</small></div>
+          <div class="progress-meta"><strong>${spentMeta}<span>★${wallet.stars}</span></strong><small>${wallet.spentStars ? "已用 · 可用" : "可用"}</small></div>
         </article>`;
     }).join("");
     $$('[data-avatar]', container).forEach((element) => setAvatar(element, element.dataset.avatar));
@@ -733,6 +848,7 @@
       button.setAttribute("aria-pressed", selected === value ? "true" : "false");
       button.addEventListener("click", () => {
         draft[field] = value;
+        draftRevision += 1;
         renderScorePicker(container, field, value);
         scheduleDraftSave();
       });
@@ -755,16 +871,14 @@
 
   function applyScoreDelta(roomId, roleId, delta) {
     const wallet = getWallet(roomId, roleId);
-    if (delta > 0) {
-      wallet.points += delta;
-      while (wallet.points >= 100) {
-        wallet.points -= 100;
-        wallet.stars += 1;
-        showToast("满 100 分，获得了一颗新的 Star ★");
-      }
-    } else if (delta < 0) {
-      wallet.points = Math.max(0, wallet.points + delta);
-    }
+    const previousEarned = wallet.earnedStars;
+    const minimumLifetime = wallet.spentStars * 100;
+    wallet.lifetimePoints = Math.max(minimumLifetime, wallet.lifetimePoints + delta);
+    wallet.points = wallet.lifetimePoints % 100;
+    wallet.earnedStars = Math.floor(wallet.lifetimePoints / 100);
+    wallet.stars = Math.max(0, wallet.earnedStars - wallet.spentStars);
+    wallet.pointsToNextStar = wallet.points === 0 ? 100 : 100 - wallet.points;
+    if (wallet.earnedStars > previousEarned) showToast("满 100 分，获得了一颗新的 Star ★");
   }
 
   async function saveToday() {
@@ -790,6 +904,9 @@
       });
       if (response) {
         delete state.drafts[key];
+        // sendCommand persists the merged state before this caller removes
+        // the committed draft. Persist once more so a reload cannot revive it.
+        persist();
       } else {
         return;
       }
@@ -800,6 +917,9 @@
       applyScoreDelta(roomId, state.sessionRole, newScore - oldScore);
       persist();
     }
+    draft = clone(getLog(roomId, state.sessionRole, today));
+    draft.images = draft.images || [];
+    draftRevision += 1;
     renderToday();
     renderTimeline();
     renderInsights();
@@ -818,7 +938,7 @@
       if (cloudSession) {
         const response = await sendCommand("toggle_reaction", { targetRoleId, date: localISO() });
         if (response) {
-          renderToday();
+          renderToday({ preserveEditor: true });
           return;
         }
         return;
@@ -1065,9 +1185,10 @@
         <article class="wallet-card">
           <span class="avatar" data-avatar="${roleId}"></span>
           <div class="wallet-copy">
-            <div><span>${escapeHTML(role.name)} 的关系钱包</span><strong>${wallet.stars} ★</strong></div>
+            <div><span>${escapeHTML(role.name)} 的关系钱包</span>${renderStarStrip(wallet)}</div>
             <div class="progress-track"><i style="width:${wallet.points}%"></i></div>
-            <small>${wallet.points}/100 · 再得 ${100 - wallet.points} 分获得下一颗</small>
+            <small>${wallet.points}/100 · 再得 ${wallet.pointsToNextStar} 分获得下一颗</small>
+            <div class="wallet-ledger"><span>累计 ${wallet.lifetimePoints} 分</span><span>已用 ${wallet.spentStars}</span><span>可用 ${wallet.stars}</span></div>
           </div>
         </article>`;
     }).join("");
@@ -1196,7 +1317,9 @@
 
   function applyBackground() {
     const source = state.backgrounds[state.sessionRole] || "";
+    if (source === appliedBackgroundSource) return;
     $("#app-shell").style.backgroundImage = source ? `url("${source}")` : "";
+    appliedBackgroundSource = source;
   }
 
   async function handleImageUpload(input, kind) {
@@ -1206,10 +1329,18 @@
     try {
       dataUrl = await fileToDataURL(file, kind === "avatar" ? 320 : 1600, kind === "avatar" ? 320 : 1000, kind === "avatar" ? 0.84 : 0.76);
       if (cloudSession) {
-        const response = await apiRequest("/api/media", {
-          method: "POST",
-          body: JSON.stringify({ kind, dataUrl }),
-        });
+        const mediaEpoch = ++mutationEpoch;
+        activeMutations += 1;
+        let response;
+        try {
+          response = await apiRequest("/api/media", {
+            method: "POST",
+            body: JSON.stringify({ kind, dataUrl }),
+          });
+        } finally {
+          activeMutations = Math.max(0, activeMutations - 1);
+        }
+        if (mediaEpoch !== mutationEpoch) return;
         mergeRemoteState(response.state, state.sessionRole);
         persist();
         renderApp();
@@ -1258,8 +1389,8 @@
     $$('[data-view]').forEach((button) => button.addEventListener("click", () => navigate(button.dataset.view)));
     $("#theme-toggle").addEventListener("click", toggleTheme);
     $("#dialog-theme-toggle").addEventListener("click", toggleTheme);
-    $("#growth-text").addEventListener("input", (event) => { draft.growthText = event.target.value; scheduleDraftSave(); });
-    $("#life-text").addEventListener("input", (event) => { draft.lifeText = event.target.value; scheduleDraftSave(); });
+    $("#growth-text").addEventListener("input", (event) => { draft.growthText = event.target.value; draftRevision += 1; scheduleDraftSave(); });
+    $("#life-text").addEventListener("input", (event) => { draft.lifeText = event.target.value; draftRevision += 1; scheduleDraftSave(); });
     $$("#editor-mode-toggle button").forEach((button) => button.addEventListener("click", () => setEditorMode(button.dataset.mode)));
     $("#save-log").addEventListener("click", saveToday);
     $("#avatar-image").addEventListener("change", (event) => handleImageUpload(event.target, "avatar"));
@@ -1325,7 +1456,11 @@
         $("#login-error").textContent = error.message || "共享空间暂时不可用，请稍后重试。";
       }
     }
-    window.addEventListener("focus", () => { if (cloudSession) refreshRemote({ silent: true }); });
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible" && cloudSession && Date.now() - lastRemoteRefreshAt > 1500) {
+        refreshRemote({ silent: true });
+      }
+    });
   }
 
   init();
