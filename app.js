@@ -242,6 +242,7 @@
   let toastTimer = null;
   let cloudSession = false;
   let refreshTimer = null;
+  let remoteRefreshInFlight = false;
 
   // The local snapshot is useful for the offline prototype, but must never be
   // treated as an authentication mechanism on a deployed site.  Only the
@@ -290,22 +291,67 @@
     return !(error instanceof ApiError) || !error.status || error.status >= 500;
   }
 
+  function isEditorFocused() {
+    const active = document.activeElement;
+    return active?.id === "growth-text"
+      || active?.id === "life-text"
+      || Boolean(active?.closest?.("#editor-compose"));
+  }
+
+  function hasUnsavedTodayDraft() {
+    if (!state.sessionRole || !draft) return false;
+    const key = logKey(currentRoomId(), state.sessionRole, localISO());
+    const saved = state.logs[key] || emptyLog();
+    return ["growthText", "lifeText", "growthScore", "lifeScore", "images"]
+      .some((field) => {
+        if (field === "images") {
+          return JSON.stringify(draft.images || []) !== JSON.stringify(saved.images || []);
+        }
+        return (draft[field] || 0) !== (saved[field] || 0);
+      });
+  }
+
+  // Polling should keep the partner's view current without replacing a
+  // textarea that the current user is typing in.  A full render replaces the
+  // textarea nodes, which moves the caret (and can look like a page refresh).
+  function renderRemoteWhileEditing() {
+    renderChrome();
+    renderPairSummary();
+    renderEditorIdentity();
+    renderPartnerPanel();
+    if (currentView === "timeline") renderTimeline();
+    if (currentView === "insights") renderInsights();
+    if (currentView === "stars") renderStars();
+    applyBackground();
+  }
+
   async function refreshRemote({ silent = true } = {}) {
-    if (!cloudSession) return false;
+    if (!cloudSession || remoteRefreshInFlight) return false;
+    remoteRefreshInFlight = true;
     // Preserve the in-memory keystrokes even if the 350ms local draft timer
     // has not fired before a poll/focus refresh starts.
     if (state.sessionRole && draft) {
       const key = logKey(currentRoomId(), state.sessionRole, localISO());
       const saved = state.logs[key] || emptyLog();
-      const changed = ["growthText", "lifeText", "growthScore", "lifeScore"]
-        .some((field) => (draft[field] || 0) !== (saved[field] || 0));
+      const changed = ["growthText", "lifeText", "growthScore", "lifeScore", "images"]
+        .some((field) => field === "images"
+          ? JSON.stringify(draft.images || []) !== JSON.stringify(saved.images || [])
+          : (draft[field] || 0) !== (saved[field] || 0));
       if (changed) state.drafts[key] = clone(draft);
     }
     try {
       const response = await apiRequest("/api/bootstrap", { method: "GET", headers: {} });
       mergeRemoteState(response.state, response.role || response.roleId || state.sessionRole);
+      // Typing can continue while the request is in flight. Preserve that
+      // latest in-memory draft against the freshly fetched log as well.
+      if (state.sessionRole && draft && hasUnsavedTodayDraft()) {
+        state.drafts[logKey(currentRoomId(), state.sessionRole, localISO())] = clone(draft);
+      }
       persist();
-      renderApp();
+      const preserveEditor = currentView === "today"
+        && (isEditorFocused() || editorMode === "preview" || hasUnsavedTodayDraft());
+      if (preserveEditor) renderRemoteWhileEditing();
+      else renderApp();
       return true;
     } catch (error) {
       if (error.status === 401) {
@@ -314,6 +360,8 @@
       }
       if (!silent) showToast(error.message || "同步失败");
       return false;
+    } finally {
+      remoteRefreshInFlight = false;
     }
   }
 
@@ -597,23 +645,20 @@
     draft.images = draft.images || [];
   }
 
-  function renderToday() {
-    const room = currentRoom();
+  function renderEditorIdentity() {
     const roleId = state.sessionRole;
+    if (!roleId || !state.roles[roleId]) return;
+    setAvatar($("#editor-avatar"), roleId);
+    $("#editor-name").textContent = state.roles[roleId].name;
+  }
+
+  function renderPartnerPanel() {
+    const room = currentRoom();
     const partner = partnerId();
     const partnerLog = getLog(room.id, partner);
-    renderPairSummary();
-
-    setAvatar($("#editor-avatar"), roleId);
     setAvatar($("#partner-avatar"), partner);
-    $("#editor-name").textContent = state.roles[roleId].name;
     $("#partner-name").textContent = state.roles[partner].name;
     $("#partner-update").textContent = partnerLog.updatedAt ? `更新于 ${partnerLog.updatedAt}` : "今天还没有记录";
-    $("#growth-text").value = draft.growthText || "";
-    $("#life-text").value = draft.lifeText || "";
-    renderScorePicker($("#growth-score"), "growthScore", draft.growthScore || 0);
-    renderScorePicker($("#life-score"), "lifeScore", draft.lifeScore || 0);
-
     const partnerContent = $("#partner-content");
     const hasPartnerContent = partnerLog.growthText || partnerLog.lifeText;
     partnerContent.classList.toggle("empty-journal", !hasPartnerContent);
@@ -621,10 +666,22 @@
       ? renderLogHTML(partnerLog)
       : `<div><strong>还在生活中</strong><p>对方记录后，会出现在这里。</p></div>`;
     renderReaction(partner);
-    setEditorMode(editorMode);
   }
 
-  function setEditorMode(mode) {
+  function renderToday({ preserveEditor = false } = {}) {
+    renderPairSummary();
+    renderEditorIdentity();
+    if (!preserveEditor) {
+      $("#growth-text").value = draft.growthText || "";
+      $("#life-text").value = draft.lifeText || "";
+      renderScorePicker($("#growth-score"), "growthScore", draft.growthScore || 0);
+      renderScorePicker($("#life-score"), "lifeScore", draft.lifeScore || 0);
+    }
+    renderPartnerPanel();
+    if (!preserveEditor) setEditorMode(editorMode, { saveDraft: false });
+  }
+
+  function setEditorMode(mode, { saveDraft = true } = {}) {
     editorMode = mode === "preview" ? "preview" : "edit";
     if (editorMode === "preview") {
       draft.growthText = $("#growth-text").value;
@@ -633,7 +690,7 @@
       const preview = $("#editor-preview");
       preview.classList.toggle("empty-journal", !html);
       preview.innerHTML = html || `<div><strong>还没有可预览的内容</strong><p>返回编辑，写下一点今天发生的事。</p></div>`;
-      scheduleDraftSave();
+      if (saveDraft) scheduleDraftSave();
     }
     $("#editor-compose").classList.toggle("is-hidden", editorMode === "preview");
     $("#editor-preview").classList.toggle("is-hidden", editorMode !== "preview");
@@ -686,8 +743,13 @@
   function scheduleDraftSave() {
     clearTimeout(draftTimer);
     draftTimer = setTimeout(() => {
-      state.drafts[logKey(currentRoomId(), state.sessionRole, localISO())] = clone(draft);
+      const key = logKey(currentRoomId(), state.sessionRole, localISO());
+      // A save can finish before this debounce fires. Do not resurrect a
+      // draft that is already identical to the committed log.
+      if (hasUnsavedTodayDraft()) state.drafts[key] = clone(draft);
+      else delete state.drafts[key];
       persist();
+      draftTimer = null;
     }, 350);
   }
 
@@ -706,6 +768,8 @@
   }
 
   async function saveToday() {
+    clearTimeout(draftTimer);
+    draftTimer = null;
     draft.growthText = $("#growth-text").value.trim();
     draft.lifeText = $("#life-text").value.trim();
     draft.updatedAt = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date());
