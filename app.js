@@ -884,43 +884,72 @@
   async function saveToday() {
     clearTimeout(draftTimer);
     draftTimer = null;
-    draft.growthText = $("#growth-text").value.trim();
-    draft.lifeText = $("#life-text").value.trim();
-    draft.updatedAt = new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date());
+    // Take an immutable snapshot for this request. The textarea can still be
+    // edited while the network request is in flight; those newer keystrokes
+    // must remain a draft instead of being accidentally committed as part of
+    // the earlier click.
+    const submittedRevision = draftRevision;
+    const submittedLog = clone({
+      ...draft,
+      growthText: $("#growth-text").value.trim(),
+      lifeText: $("#life-text").value.trim(),
+      updatedAt: new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date()),
+      images: Array.isArray(draft.images) ? [...draft.images] : [],
+    });
     const today = localISO();
     const roomId = currentRoomId();
     const key = logKey(roomId, state.sessionRole, today);
     const previous = state.logs[key] || emptyLog();
     const oldScore = (previous.growthScore || 0) + (previous.lifeScore || 0);
-    const newScore = (draft.growthScore || 0) + (draft.lifeScore || 0);
+    const newScore = (submittedLog.growthScore || 0) + (submittedLog.lifeScore || 0);
+    let preserveEditorAfterSave = false;
     if (cloudSession) {
       const response = await sendCommand("save_log", {
         date: today,
-        growthText: draft.growthText,
-        lifeText: draft.lifeText,
-        growthScore: draft.growthScore || 0,
-        lifeScore: draft.lifeScore || 0,
-        images: draft.images || [],
+        growthText: submittedLog.growthText,
+        lifeText: submittedLog.lifeText,
+        growthScore: submittedLog.growthScore || 0,
+        lifeScore: submittedLog.lifeScore || 0,
+        images: submittedLog.images,
       });
-      if (response) {
-        delete state.drafts[key];
-        // sendCommand persists the merged state before this caller removes
-        // the committed draft. Persist once more so a reload cannot revive it.
-        persist();
-      } else {
-        return;
+      if (!response) return;
+
+      // The command writes the row transactionally, but the follow-up
+      // bootstrap read can briefly come from a lagging replica. Never replace
+      // a just-saved editor with that stale snapshot. The submitted payload is
+      // the authoritative local representation until the next refresh.
+      const savedLog = {
+        ...submittedLog,
+        updatedAt: submittedLog.updatedAt,
+      };
+      const rpcLog = response.result?.log;
+      if (rpcLog && (!rpcLog.log_date || rpcLog.log_date === today)) {
+        if (typeof rpcLog.growth_text === "string") savedLog.growthText = rpcLog.growth_text;
+        if (typeof rpcLog.life_text === "string") savedLog.lifeText = rpcLog.life_text;
+        if (Number.isInteger(Number(rpcLog.growth_score))) savedLog.growthScore = Number(rpcLog.growth_score);
+        if (Number.isInteger(Number(rpcLog.life_score))) savedLog.lifeScore = Number(rpcLog.life_score);
+        if (Array.isArray(rpcLog.images)) savedLog.images = rpcLog.images;
       }
+      const editedDuringSave = draftRevision !== submittedRevision;
+      preserveEditorAfterSave = editedDuringSave;
+      state.logs[key] = savedLog;
+      if (editedDuringSave) state.drafts[key] = clone(draft);
+      else delete state.drafts[key];
+      persist();
+      if (!editedDuringSave) draft = clone(savedLog);
     }
     if (!cloudSession) {
-      state.logs[key] = clone(draft);
+      state.logs[key] = clone(submittedLog);
       delete state.drafts[key];
       applyScoreDelta(roomId, state.sessionRole, newScore - oldScore);
       persist();
     }
-    draft = clone(getLog(roomId, state.sessionRole, today));
-    draft.images = draft.images || [];
+    if (!cloudSession) {
+      draft = clone(getLog(roomId, state.sessionRole, today));
+      draft.images = draft.images || [];
+    }
     draftRevision += 1;
-    renderToday();
+    renderToday({ preserveEditor: preserveEditorAfterSave });
     renderTimeline();
     renderInsights();
     renderStars();
