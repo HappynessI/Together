@@ -2,6 +2,7 @@
   "use strict";
 
   const STORE_KEY = "pair-journal-prototype-v5";
+  const CHECKIN_PENDING_STORE_KEY = "pair-journal-checkin-pending-v1";
   const PASSWORDS = { me: "solarized", partner: "bluebird" };
   const VIEW_TITLES = {
     today: "今天，继续并肩",
@@ -248,6 +249,7 @@
   let draftRevision = 0;
   let lastRemoteRefreshAt = 0;
   let appliedBackgroundSource = null;
+  let journalAction = null;
 
   // The local snapshot is useful for the offline prototype, but must never be
   // treated as an authentication mechanism on a deployed site.  Only the
@@ -257,11 +259,12 @@
     || localPreviewHost.has(window.location.hostname);
 
   class ApiError extends Error {
-    constructor(message, status = 0, code = "API_ERROR") {
+    constructor(message, status = 0, code = "API_ERROR", details = null) {
       super(message);
       this.name = "ApiError";
       this.status = status;
       this.code = code;
+      this.details = details && typeof details === "object" ? details : null;
     }
   }
 
@@ -274,7 +277,19 @@
     let body = null;
     try { body = await response.json(); } catch { /* empty response */ }
     if (!response.ok || !body?.ok) {
-      throw new ApiError(body?.error?.message || `请求失败（${response.status}）`, response.status, body?.error?.code);
+      const retryAfterHeader = Number(response.headers.get("Retry-After"));
+      const details = body?.error?.details && typeof body.error.details === "object"
+        ? { ...body.error.details }
+        : {};
+      if (!details.retryAfter && Number.isFinite(retryAfterHeader) && retryAfterHeader > 0) {
+        details.retryAfter = retryAfterHeader;
+      }
+      throw new ApiError(
+        body?.error?.message || `请求失败（${response.status}）`,
+        response.status,
+        body?.error?.code,
+        Object.keys(details).length ? details : null,
+      );
     }
     return body;
   }
@@ -566,6 +581,36 @@
     toastTimer = setTimeout(() => toast.classList.remove("is-visible"), 2200);
   }
 
+  function setCheckinStatus(message = "", tone = "", kind = "action") {
+    const status = $("#checkin-status");
+    if (!status) return;
+    status.textContent = message;
+    if (tone) status.dataset.tone = tone;
+    else delete status.dataset.tone;
+    if (kind) status.dataset.kind = kind;
+    else delete status.dataset.kind;
+  }
+
+  function setJournalActionState(action = null) {
+    journalAction = action;
+    const saveButton = $("#save-log");
+    const checkinButton = $("#checkin-notify");
+    if (!saveButton || !checkinButton) return;
+
+    saveButton.disabled = Boolean(action);
+    checkinButton.disabled = Boolean(action) || !cloudSession;
+    saveButton.textContent = action === "save" ? "保存中…" : "保存今日记录";
+    checkinButton.textContent = action === "checkin" ? "发送中…" : "打卡并通知搭档";
+    checkinButton.title = cloudSession ? "" : "邮件通知仅在共享版可用";
+
+    const status = $("#checkin-status");
+    if (!cloudSession && !action && (!status.textContent || status.dataset.kind === "availability")) {
+      setCheckinStatus("邮件通知仅在共享版可用", "", "availability");
+    } else if (cloudSession && status.dataset.kind === "availability") {
+      setCheckinStatus();
+    }
+  }
+
   function applyTheme() {
     document.documentElement.dataset.theme = state.theme;
     const themeColor = state.theme === "dark" ? "#002b36" : "#fdf6e3";
@@ -793,6 +838,7 @@
     }
     renderPartnerPanel();
     if (!preserveEditor) setEditorMode(editorMode, { saveDraft: false });
+    setJournalActionState(journalAction);
   }
 
   function setEditorMode(mode, { saveDraft = true } = {}) {
@@ -881,7 +927,7 @@
     if (wallet.earnedStars > previousEarned) showToast("满 100 分，获得了一颗新的 Star ★");
   }
 
-  async function saveToday() {
+  async function saveToday({ showSuccess = true, showFailure = true } = {}) {
     clearTimeout(draftTimer);
     draftTimer = null;
     // Take an immutable snapshot for this request. The textarea can still be
@@ -911,8 +957,13 @@
         growthScore: submittedLog.growthScore || 0,
         lifeScore: submittedLog.lifeScore || 0,
         images: submittedLog.images,
-      });
-      if (!response) return;
+      }, { silent: true });
+      if (!response) {
+        state.drafts[key] = clone(draft);
+        persist();
+        if (showFailure) showToast("今日记录保存失败，请稍后重试");
+        return { ok: false, date: today, log: submittedLog };
+      }
 
       // The command writes the row transactionally, but the follow-up
       // bootstrap read can briefly come from a lagging replica. Never replace
@@ -953,7 +1004,222 @@
     renderTimeline();
     renderInsights();
     renderStars();
-    showToast(cloudSession ? "今日记录已同步" : "今日记录已保存");
+    if (showSuccess) showToast(cloudSession ? "今日记录已同步" : "今日记录已保存");
+    return { ok: true, date: today, log: clone(state.logs[key] || submittedLog) };
+  }
+
+  async function handleSaveToday() {
+    if (journalAction) return;
+    if (cloudSession) setCheckinStatus();
+    setJournalActionState("save");
+    try {
+      const result = await saveToday({ showSuccess: true, showFailure: false });
+      if (!result.ok) {
+        setCheckinStatus("今日记录保存失败，请稍后重试", "error");
+        showToast("今日记录保存失败，请稍后重试");
+      }
+    } finally {
+      setJournalActionState();
+    }
+  }
+
+  function createIdempotencyKey() {
+    if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+    const bytes = crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0"));
+    return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
+  }
+
+  function checkinPendingKey(roleId, date) {
+    return `${roleId}|${date}`;
+  }
+
+  function readPendingCheckins() {
+    try {
+      const value = JSON.parse(localStorage.getItem(CHECKIN_PENDING_STORE_KEY) || "{}");
+      return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function pendingCheckin(roleId, date) {
+    const pending = readPendingCheckins()[checkinPendingKey(roleId, date)];
+    return pending && typeof pending.idempotencyKey === "string"
+      && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(pending.idempotencyKey)
+      ? pending
+      : null;
+  }
+
+  function rememberPendingCheckin(roleId, date) {
+    const existing = pendingCheckin(roleId, date);
+    if (existing) return { ...existing, reused: true };
+
+    const pending = {
+      idempotencyKey: createIdempotencyKey(),
+      createdAt: new Date().toISOString(),
+    };
+    try {
+      const all = readPendingCheckins();
+      all[checkinPendingKey(roleId, date)] = pending;
+      localStorage.setItem(CHECKIN_PENDING_STORE_KEY, JSON.stringify(all));
+    } catch (error) {
+      console.warn("Could not persist pending check-in", error);
+    }
+    return { ...pending, reused: false };
+  }
+
+  function clearPendingCheckin(roleId, date) {
+    try {
+      const all = readPendingCheckins();
+      delete all[checkinPendingKey(roleId, date)];
+      if (Object.keys(all).length) localStorage.setItem(CHECKIN_PENDING_STORE_KEY, JSON.stringify(all));
+      else localStorage.removeItem(CHECKIN_PENDING_STORE_KEY);
+    } catch (error) {
+      console.warn("Could not clear pending check-in", error);
+    }
+  }
+
+  function retryAfterText(error) {
+    const seconds = Number(error?.details?.retryAfter);
+    if (!Number.isFinite(seconds) || seconds <= 0) return "请稍后再试";
+    if (seconds < 60) return `请 ${Math.ceil(seconds)} 秒后再试`;
+    return `请 ${Math.ceil(seconds / 60)} 分钟后再试`;
+  }
+
+  function savedDateLabel(date) {
+    try { return shortDate(date); } catch { return date; }
+  }
+
+  function checkinErrorState(error, date) {
+    const code = String(error?.code || "").toUpperCase();
+    const partialPrefix = "记录已保存，但";
+
+    if (code === "CHECKIN_ALREADY_SENT") {
+      return { sent: true, keepKey: false, message: "今天已经打过卡，邮件已通知搭档（没有重复发送）" };
+    }
+    if (code === "CHECKIN_IN_PROGRESS") {
+      return {
+        sent: false,
+        keepKey: true,
+        message: `${partialPrefix}通知仍在处理中，${retryAfterText(error)}；再次点击会查询同一次打卡，不会重复发送`,
+      };
+    }
+    if (code === "CHECKIN_DELIVERY_UNKNOWN") {
+      return {
+        sent: false,
+        keepKey: true,
+        message: `${partialPrefix}邮件发送结果暂时无法确认，请不要立即重试；稍后再次点击可确认同一次打卡`,
+      };
+    }
+    if (error?.status === 401 || code === "UNAUTHORIZED" || code === "SESSION_EXPIRED") {
+      return { sent: false, keepKey: false, message: `${partialPrefix}登录已过期，通知未发送；请重新登录后再打卡` };
+    }
+    if (code === "EMAIL_NOT_CONFIGURED") {
+      return { sent: false, keepKey: false, message: `${partialPrefix}邮件通知尚未配置，请联系维护者` };
+    }
+    if (code === "EMAIL_SEND_FAILED") {
+      return { sent: false, keepKey: false, message: `${partialPrefix}邮件服务器拒绝了通知；检查邮箱配置后可以重新打卡` };
+    }
+    if (error?.status === 429 || code === "CHECKIN_RATE_LIMITED") {
+      return { sent: false, keepKey: false, message: `${partialPrefix}通知请求过于频繁，${retryAfterText(error)}` };
+    }
+    if (["INVALID_CHECKIN_DATE", "CHECKIN_DATE_MISMATCH", "CHECKIN_LOG_DATE_MISMATCH"].includes(code)) {
+      return {
+        sent: false,
+        keepKey: false,
+        message: `记录已保存到 ${savedDateLabel(date)}，但当前已跨过零点，邮件未发送；请刷新页面后记录今天再打卡`,
+      };
+    }
+    if (["CHECKIN_LOG_NOT_FOUND", "CHECKIN_NOT_FOUND", "NOT_FOUND"].includes(code) || error?.status === 404) {
+      return {
+        sent: false,
+        keepKey: false,
+        message: `记录已保存到 ${savedDateLabel(date)}，但服务端暂未找到这条正式记录，邮件未发送；请稍后重新打开页面再试`,
+      };
+    }
+    if (!(error instanceof ApiError) || !error.status || error.status >= 500) {
+      return {
+        sent: false,
+        keepKey: true,
+        message: `${partialPrefix}通知结果暂时无法确认，请不要立即重试；稍后再次点击会复用同一次打卡`,
+      };
+    }
+    return { sent: false, keepKey: false, message: `${partialPrefix}通知失败：${error.message || "请稍后重试"}` };
+  }
+
+  async function checkinAndNotify() {
+    if (journalAction) return;
+    if (!cloudSession) {
+      setCheckinStatus("邮件通知仅在共享版可用", "", "availability");
+      showToast("邮件通知仅在共享版可用");
+      return;
+    }
+
+    const growthText = $("#growth-text").value.trim();
+    const lifeText = $("#life-text").value.trim();
+    const growthScore = Number(draft.growthScore || 0);
+    const lifeScore = Number(draft.lifeScore || 0);
+    if (!growthText && !lifeText && growthScore === 0 && lifeScore === 0) {
+      setCheckinStatus("先写一点今天的记录，或至少选择一项评分", "error");
+      showToast("先写一点今天的记录，或至少选择一项评分");
+      return;
+    }
+
+    setCheckinStatus("正在保存记录并通知搭档…");
+    setJournalActionState("checkin");
+    const roleId = state.sessionRole;
+    let recordSaved = false;
+    let checkinDate = localISO();
+    try {
+      const saveResult = await saveToday({ showSuccess: false, showFailure: false });
+      if (!saveResult.ok) {
+        setCheckinStatus("记录保存失败，未发送通知", "error");
+        showToast("记录保存失败，未发送通知");
+        return;
+      }
+      recordSaved = true;
+      checkinDate = saveResult.date;
+      const pending = rememberPendingCheckin(roleId, checkinDate);
+      if (pending.reused) {
+        setCheckinStatus("正在确认上一次打卡结果，请勿重复点击…");
+      }
+
+      activeMutations += 1;
+      let response;
+      try {
+        response = await apiRequest("/api/checkin", {
+          method: "POST",
+          body: JSON.stringify({ date: checkinDate, idempotencyKey: pending.idempotencyKey }),
+        });
+      } finally {
+        activeMutations = Math.max(0, activeMutations - 1);
+      }
+
+      const quote = typeof response.quote === "string" ? response.quote.trim() : "";
+      const statusText = quote
+        ? `已打卡，邮件已通知搭档 · 本周格言：${quote}`
+        : "已打卡，邮件已通知搭档";
+      clearPendingCheckin(roleId, checkinDate);
+      setCheckinStatus(statusText, "success");
+      showToast("已打卡，邮件已通知搭档");
+    } catch (error) {
+      if (error.status === 401) {
+        cloudSession = false;
+        stopRemoteRefresh();
+      }
+      const errorState = recordSaved
+        ? checkinErrorState(error, checkinDate)
+        : { sent: false, keepKey: false, message: "记录保存失败，未发送通知" };
+      if (recordSaved && !errorState.keepKey) clearPendingCheckin(roleId, checkinDate);
+      setCheckinStatus(errorState.message, errorState.sent ? "success" : "error");
+      showToast(errorState.message);
+      console.warn("Check-in notification failed", error);
+    } finally {
+      setJournalActionState();
+    }
   }
 
   function renderReaction(targetRoleId) {
@@ -1421,7 +1687,8 @@
     $("#growth-text").addEventListener("input", (event) => { draft.growthText = event.target.value; draftRevision += 1; scheduleDraftSave(); });
     $("#life-text").addEventListener("input", (event) => { draft.lifeText = event.target.value; draftRevision += 1; scheduleDraftSave(); });
     $$("#editor-mode-toggle button").forEach((button) => button.addEventListener("click", () => setEditorMode(button.dataset.mode)));
-    $("#save-log").addEventListener("click", saveToday);
+    $("#save-log").addEventListener("click", handleSaveToday);
+    $("#checkin-notify").addEventListener("click", checkinAndNotify);
     $("#avatar-image").addEventListener("change", (event) => handleImageUpload(event.target, "avatar"));
     $("#background-image").addEventListener("change", (event) => handleImageUpload(event.target, "background"));
     $("#wish-form").addEventListener("submit", createWish);

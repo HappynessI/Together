@@ -1,6 +1,7 @@
 node_modules/
 .env
 .env.local
+smtp.env
 .vercel/
 .DS_Store
 .vercel

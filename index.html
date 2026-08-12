@@ -153,7 +153,13 @@
 
             <div class="editor-footer">
               <span class="markdown-hint">支持标题、复选框和 <code>命令</code>，点击“预览”查看排版</span>
-              <button id="save-log" type="button" class="primary-button">保存今日记录</button>
+              <div class="editor-actions">
+                <div class="editor-action-buttons">
+                  <button id="save-log" type="button" class="primary-button">保存今日记录</button>
+                  <button id="checkin-notify" type="button" class="checkin-button">打卡并通知搭档</button>
+                </div>
+                <p id="checkin-status" class="checkin-status" role="status" aria-live="polite"></p>
+              </div>
             </div>
           </article>
 

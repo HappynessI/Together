@@ -57,7 +57,30 @@ APP_PASSWORD_ME_HASH
 APP_PASSWORD_PARTNER_HASH
 SESSION_SECRET
 APP_TIMEZONE=Asia/Shanghai
+QQ_USER
+QQ_AUTH
+QQ_TO_PARTNER
+QQ_TO_ME
+APP_PUBLIC_URL
 ```
+
+邮件通知使用 QQ 邮箱 SMTP：
+
+- `QQ_USER`：用于发信的 QQ 邮箱。
+- `QQ_AUTH`：QQ 邮箱生成的 SMTP 授权码，不是邮箱登录密码。
+- `QQ_TO_PARTNER`：本人点击打卡时，接收邮件的搭档邮箱。
+- `QQ_TO_ME`：搭档点击打卡时，接收邮件的本人邮箱；不填时默认使用 `QQ_USER`。
+- `APP_PUBLIC_URL`：邮件里“打开并肩”按钮指向的正式网址。
+
+旧配置名 `QQ_TO` 仍可作为 `QQ_TO_PARTNER` 的兼容值。授权码与邮箱地址只放在 Vercel 服务端环境变量中；不要上传或提交 `smtp.env`。
+
+邮件通知还需要持久化防重复记录。已有 Supabase 项目请先在 SQL Editor 执行：
+
+```text
+supabase/migrations/20260813_checkin_notifications.sql
+```
+
+新建环境则依次执行 `supabase/schema.sql` 和上述迁移。迁移会建立仅供 service role 使用的通知 outbox；浏览器既不能读取收件地址，也不能自行提交邮件正文。
 
 `SESSION_SECRET` 至少 32 个随机字节，例如：
 
@@ -65,7 +88,7 @@ APP_TIMEZONE=Asia/Shanghai
 openssl rand -base64 48
 ```
 
-配置完成后重新部署。将 Vercel 生成的网址发给朋友即可：两个人输入各自密码，记录、评分、Stars、愿望、回应和头像/背景都会通过服务端共享。页面可见时每 20 秒检查一次远端状态，回到页面时再检查一次；数据没有变化时不会更新 DOM，确有变化时也只刷新当前区域，不会重建编辑器或跳动光标。编辑中的内容先自动保存为本机草稿，点击“保存今日记录”后才同步给对方。
+配置完成后重新部署。将 Vercel 生成的网址发给朋友即可：两个人输入各自密码，记录、评分、Stars、愿望、回应和头像/背景都会通过服务端共享。页面可见时每 20 秒检查一次远端状态，回到页面时再检查一次；数据没有变化时不会更新 DOM，确有变化时也只刷新当前区域，不会重建编辑器或跳动光标。编辑中的内容先自动保存为本机草稿，点击“保存今日记录”后才同步给对方；点击“打卡并通知搭档”会先保存当前记录，再将记录与本周格言发到搭档邮箱。离线预览不会发送真实邮件。
 
 已有表格积分可通过 `wallets.opening_lifetime_points` 与 `opening_spent_stars` 结转，不需要伪造历史日志或愿望。真实打卡内容和结转数值只保存在 Supabase，不写入公开代码仓库。
 
