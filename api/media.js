@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import {
   HttpError,
   MEDIA_BUCKET,
+  appTimeMetadata,
   extensionForMime,
   getSupabase,
   loadState,
@@ -113,5 +114,5 @@ export default withApiHandler(async (req, res) => {
 
   const state = await loadState(roleId);
   const url = upload.kind === "avatar" ? state.roles[roleId]?.avatar : state.backgrounds[roleId];
-  sendJson(res, 200, { ok: true, kind: upload.kind, url, state });
+  sendJson(res, 200, { ok: true, kind: upload.kind, url, state, ...appTimeMetadata() });
 });

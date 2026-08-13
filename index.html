@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#fdf6e3">
   <title>并肩 · 双人生活打卡</title>
-  <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./styles.css?v=20260813-cross-day">
 </head>
 <body>
   <div id="ambient" aria-hidden="true"></div>
@@ -130,6 +130,14 @@
                 <span class="status-dot"><i></i> 自动保存草稿</span>
               </div>
             </header>
+
+            <aside id="previous-draft-notice" class="previous-draft-notice is-hidden" aria-live="polite">
+              <div><strong id="previous-draft-title">昨天还有一份未完成草稿</strong><span>它没有混入今天，可随时查看或手动复制。</span></div>
+              <div class="previous-draft-actions">
+                <button id="view-previous-draft" type="button" class="text-button">查看草稿</button>
+                <button id="copy-previous-draft" type="button" class="secondary-button">复制到今天</button>
+              </div>
+            </aside>
 
             <div id="editor-compose">
               <div class="track-editor growth-track">
@@ -284,7 +292,18 @@
     </form>
   </dialog>
 
+  <dialog id="previous-draft-dialog" class="settings-dialog">
+    <div class="dialog-card">
+      <header><div><p class="eyebrow">UNFINISHED DRAFT</p><h3 id="previous-draft-dialog-title">昨日未完成草稿</h3></div><button id="close-previous-draft" type="button" class="icon-button" aria-label="关闭">×</button></header>
+      <div id="previous-draft-preview" class="rendered-journal previous-draft-preview"></div>
+      <footer class="previous-draft-dialog-footer">
+        <small>草稿仍归属于原日期，不会自动计入今天。</small>
+        <button id="copy-previous-draft-dialog" type="button" class="primary-button">复制到今天</button>
+      </footer>
+    </div>
+  </dialog>
+
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script src="./app.js"></script>
+  <script src="./app.js?v=20260813-cross-day"></script>
 </body>
 </html>

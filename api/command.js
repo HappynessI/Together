@@ -1,8 +1,9 @@
 import {
   HttpError,
   ROOM_ID,
+  appTimeMetadata,
+  assertCurrentAppDate,
   assertRole,
-  dateInTimezone,
   getSupabase,
   loadState,
   methodNotAllowed,
@@ -14,7 +15,6 @@ import {
   sanitizeWishText,
   sendJson,
   throwIfSupabaseError,
-  validateDate,
   withApiHandler,
 } from "../lib/server.js";
 
@@ -28,9 +28,14 @@ function payloadFrom(body) {
 }
 
 async function saveLog(supabase, roleId, payload) {
-  const log = sanitizeLog(payload.log && typeof payload.log === "object"
+  const submittedLog = payload.log && typeof payload.log === "object"
     ? { ...payload.log, date: payload.date || payload.log.date }
-    : payload);
+    : payload;
+  const date = assertCurrentAppDate(submittedLog.date, {
+    code: "LOG_DATE_MISMATCH",
+    message: "当前日期已经变化，请刷新页面后再保存今日记录。",
+  });
+  const log = sanitizeLog({ ...submittedLog, date });
   const { data, error } = await supabase.rpc("save_daily_log", {
     p_room_id: ROOM_ID,
     p_role_id: roleId,
@@ -48,7 +53,10 @@ async function saveLog(supabase, roleId, payload) {
 async function toggleReaction(supabase, roleId, payload) {
   const targetRoleId = assertRole(payload.targetRoleId || payload.target || partnerRole(roleId));
   if (targetRoleId === roleId) throw new HttpError(400, "INVALID_TARGET", "不能回应自己的记录。");
-  const date = validateDate(payload.date, dateInTimezone());
+  const date = assertCurrentAppDate(payload.date, {
+    code: "REACTION_DATE_MISMATCH",
+    message: "当前日期已经变化，请刷新页面后再回应。",
+  });
   const { data, error } = await supabase.rpc("toggle_reaction", {
     p_room_id: ROOM_ID,
     p_target_role_id: targetRoleId,
@@ -141,5 +149,5 @@ export default withApiHandler(async (req, res) => {
   }
 
   const state = await loadState(roleId);
-  sendJson(res, 200, { ok: true, result, state });
+  sendJson(res, 200, { ok: true, result, state, ...appTimeMetadata() });
 });

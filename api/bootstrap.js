@@ -1,4 +1,5 @@
 import {
+  appTimeMetadata,
   loadState,
   methodNotAllowed,
   requireSession,
@@ -15,6 +16,6 @@ export default withApiHandler(async (req, res) => {
     role: roleId,
     roleId,
     state,
-    serverTime: new Date().toISOString(),
+    ...appTimeMetadata(),
   });
 });

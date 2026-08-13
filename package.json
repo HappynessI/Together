@@ -9,7 +9,9 @@
   "scripts": {
     "dev": "vercel dev",
     "hash-password": "node scripts/hash-password.mjs",
-    "check": "node --check app.js && node --check lib/server.js && node --check lib/checkin-email.js && node --check api/login.js && node --check api/bootstrap.js && node --check api/command.js && node --check api/checkin.js && node --check api/logout.js && node --check api/media.js"
+    "check": "node --check app.js && node --check lib/server.js && node --check lib/checkin-email.js && node --check api/login.js && node --check api/bootstrap.js && node --check api/command.js && node --check api/checkin.js && node --check api/logout.js && node --check api/media.js",
+    "test": "node --test tests/*.test.mjs",
+    "verify": "npm run check && npm test"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.55.0",

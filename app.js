@@ -3,6 +3,8 @@
 
   const STORE_KEY = "pair-journal-prototype-v5";
   const CHECKIN_PENDING_STORE_KEY = "pair-journal-checkin-pending-v1";
+  const DRAFT_RECOVERY_STORE_KEY = "pair-journal-draft-recovery-v2";
+  const MAX_LOG_IMAGES = 6;
   const PASSWORDS = { me: "solarized", partner: "bluebird" };
   const VIEW_TITLES = {
     today: "今天，继续并肩",
@@ -15,12 +17,29 @@
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
   const clone = (value) => JSON.parse(JSON.stringify(value));
+  const crossDayTestClock = new URLSearchParams(window.location.search).has("cross-day-test-clock");
+  let crossDayTestOffset = 0;
+  const appNowMs = () => Date.now() + crossDayTestOffset;
 
   function localISO(date = new Date()) {
     const y = date.getFullYear();
     const m = String(date.getMonth() + 1).padStart(2, "0");
     const d = String(date.getDate()).padStart(2, "0");
     return `${y}-${m}-${d}`;
+  }
+
+  function isoInTimezone(date, timezone) {
+    if (!timezone) return localISO(date);
+    const parts = new Intl.DateTimeFormat("en", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    }).formatToParts(date).reduce((result, part) => {
+      if (part.type !== "literal") result[part.type] = part.value;
+      return result;
+    }, {});
+    return `${parts.year}-${parts.month}-${parts.day}`;
   }
 
   function parseISO(value) {
@@ -228,8 +247,66 @@
     }
   }
 
+  function emptyDraftRecovery() {
+    return { version: 2, initialized: false, items: {}, recoveredStateKeys: [] };
+  }
+
+  function loadDraftRecovery() {
+    try {
+      const value = JSON.parse(localStorage.getItem(DRAFT_RECOVERY_STORE_KEY) || "null");
+      if (!value || value.version !== 2 || typeof value.items !== "object") return emptyDraftRecovery();
+      return {
+        version: 2,
+        initialized: Boolean(value.initialized),
+        items: value.items || {},
+        recoveredStateKeys: Array.isArray(value.recoveredStateKeys) ? value.recoveredStateKeys : [],
+      };
+    } catch {
+      return emptyDraftRecovery();
+    }
+  }
+
+  function persistDraftRecovery(value = draftRecovery) {
+    try {
+      localStorage.setItem(DRAFT_RECOVERY_STORE_KEY, JSON.stringify(value));
+      return true;
+    } catch (error) {
+      console.warn("Could not persist draft recovery metadata", error);
+      return false;
+    }
+  }
+
+  function legacyRecoveryId(key) {
+    return `legacy:${encodeURIComponent(key)}`;
+  }
+
+  function initializeDraftRecovery() {
+    if (draftRecovery.initialized) return true;
+    const existingDrafts = clone(state.drafts || {});
+    const next = clone(draftRecovery);
+    Object.entries(existingDrafts).forEach(([key, log]) => {
+      next.items[legacyRecoveryId(key)] = { key, log: clone(log), recovered: false, kind: "legacy" };
+    });
+    next.initialized = true;
+    if (!persistDraftRecovery(next)) return false;
+    draftRecovery = next;
+    state.drafts = {};
+    persist();
+    return true;
+  }
+
+  function legacyRecoveryForKey(key) {
+    return Object.values(draftRecovery.items || {}).find((item) => item?.kind === "legacy" && item.key === key && !item.recovered) || null;
+  }
+
+  function isLegacyDuplicate(key, log) {
+    const legacy = legacyRecoveryForKey(key);
+    return Boolean(legacy && JSON.stringify(canonicalValue(legacy.log)) === JSON.stringify(canonicalValue(log)));
+  }
+
   if (new URLSearchParams(window.location.search).has("reset-demo")) {
     localStorage.removeItem(STORE_KEY);
+    localStorage.removeItem(DRAFT_RECOVERY_STORE_KEY);
     window.history.replaceState({}, "", window.location.pathname);
   }
 
@@ -250,6 +327,17 @@
   let lastRemoteRefreshAt = 0;
   let appliedBackgroundSource = null;
   let journalAction = null;
+  let editorDate = null;
+  let appTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || null;
+  let authoritativeAppDate = null;
+  let authoritativeDateLocked = false;
+  let serverClockAnchor = null;
+  let latestAcceptedServerTimeMs = Number.NEGATIVE_INFINITY;
+  let dateCheckTimer = null;
+  let recoverableDraftRecord = null;
+  let openedRecoverableDraftRecord = null;
+  let rolloverStorageBlocked = false;
+  let draftRecovery = loadDraftRecovery();
 
   // The local snapshot is useful for the offline prototype, but must never be
   // treated as an authentication mechanism on a deployed site.  Only the
@@ -268,12 +356,85 @@
     }
   }
 
+  function validISODate(value) {
+    if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+    const parsed = new Date(`${value}T00:00:00Z`);
+    return Number.isFinite(parsed.valueOf()) && parsed.toISOString().slice(0, 10) === value;
+  }
+
+  function estimatedAppNowMs() {
+    if (!serverClockAnchor) return appNowMs();
+    return serverClockAnchor.serverMs + Math.max(0, performance.now() - serverClockAnchor.performanceNow);
+  }
+
+  function calculatedBusinessDate() {
+    const adjustedNow = new Date(estimatedAppNowMs());
+    try {
+      return isoInTimezone(adjustedNow, appTimezone);
+    } catch {
+      return localISO(adjustedNow);
+    }
+  }
+
+  function currentAppDate() {
+    if (authoritativeDateLocked && authoritativeAppDate) return authoritativeAppDate;
+    const calculated = calculatedBusinessDate();
+    if (authoritativeAppDate && calculated < authoritativeAppDate) return authoritativeAppDate;
+    return calculated;
+  }
+
+  function currentAppTimeLabel() {
+    const adjustedNow = new Date(estimatedAppNowMs());
+    return new Intl.DateTimeFormat("zh-CN", {
+      timeZone: appTimezone || undefined,
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).format(adjustedNow);
+  }
+
+  function ingestAppTimeMetadata(source, timing = {}) {
+    if (!source || typeof source !== "object") return;
+    const serverTime = Date.parse(source.serverTime);
+    if (!Number.isFinite(serverTime) || serverTime < latestAcceptedServerTimeMs) return;
+
+    const timezone = typeof source.appTimezone === "string" ? source.appTimezone.trim() : "";
+    if (timezone) {
+      try {
+        new Intl.DateTimeFormat("en", { timeZone: timezone }).format();
+        appTimezone = timezone;
+      } catch {
+        // Keep the browser timezone if an older browser cannot resolve this zone.
+      }
+    }
+
+    const roundTripMs = Number.isFinite(timing.performanceStart) && Number.isFinite(timing.performanceEnd)
+      ? Math.max(0, timing.performanceEnd - timing.performanceStart)
+      : 0;
+    serverClockAnchor = {
+      serverMs: serverTime + (roundTripMs / 2),
+      performanceNow: Number.isFinite(timing.performanceEnd) ? timing.performanceEnd : performance.now(),
+    };
+    latestAcceptedServerTimeMs = serverTime;
+    if (validISODate(source.appDate)) authoritativeAppDate = source.appDate;
+    authoritativeDateLocked = false;
+  }
+
+  function ingestAppDateHint(value) {
+    if (!validISODate(value)) return;
+    authoritativeAppDate = value;
+    authoritativeDateLocked = true;
+    serverClockAnchor = null;
+  }
+
   async function apiRequest(path, options = {}) {
+    const performanceStart = performance.now();
     const response = await fetch(path, {
       credentials: "same-origin",
       headers: { "Content-Type": "application/json", ...(options.headers || {}) },
       ...options,
     });
+    const performanceEnd = performance.now();
     let body = null;
     try { body = await response.json(); } catch { /* empty response */ }
     if (!response.ok || !body?.ok) {
@@ -284,6 +445,7 @@
       if (!details.retryAfter && Number.isFinite(retryAfterHeader) && retryAfterHeader > 0) {
         details.retryAfter = retryAfterHeader;
       }
+      ingestAppDateHint(details.appDate);
       throw new ApiError(
         body?.error?.message || `请求失败（${response.status}）`,
         response.status,
@@ -291,6 +453,7 @@
         Object.keys(details).length ? details : null,
       );
     }
+    ingestAppTimeMetadata(body, { performanceStart, performanceEnd });
     return body;
   }
 
@@ -371,17 +534,90 @@
     return !(error instanceof ApiError) || !error.status || error.status >= 500;
   }
 
-  function hasUnsavedTodayDraft() {
-    if (!state.sessionRole || !draft) return false;
-    const key = logKey(currentRoomId(), state.sessionRole, localISO());
+  function hasUnsavedDraftForDate(date = editorDate, value = draft) {
+    if (!state.sessionRole || !date || !value) return false;
+    const key = logKey(currentRoomId(), state.sessionRole, date);
     const saved = state.logs[key] || emptyLog();
     return ["growthText", "lifeText", "growthScore", "lifeScore", "images"]
       .some((field) => {
         if (field === "images") {
-          return JSON.stringify(draft.images || []) !== JSON.stringify(saved.images || []);
+          return JSON.stringify(value.images || []) !== JSON.stringify(saved.images || []);
         }
-        return (draft[field] || 0) !== (saved[field] || 0);
+        return (value[field] || 0) !== (saved[field] || 0);
       });
+  }
+
+  function syncDraftFromEditor() {
+    const growthInput = $("#growth-text");
+    const lifeInput = $("#life-text");
+    if (!editorDate || !growthInput || !lifeInput) return;
+    draft.growthText = growthInput.value;
+    draft.lifeText = lifeInput.value;
+  }
+
+  function storeDraftForDate(date, value = draft) {
+    if (!state.sessionRole || !date || !value) return false;
+    const key = logKey(currentRoomId(), state.sessionRole, date);
+    const shouldKeep = hasUnsavedDraftForDate(date, value);
+    if (shouldKeep) state.drafts[key] = clone(value);
+    else delete state.drafts[key];
+    return shouldKeep;
+  }
+
+  function flushEditorDraft() {
+    clearTimeout(draftTimer);
+    draftTimer = null;
+    if (!editorDate || !state.sessionRole) return true;
+    const key = logKey(currentRoomId(), state.sessionRole, editorDate);
+    const previous = Object.prototype.hasOwnProperty.call(state.drafts, key)
+      ? JSON.stringify(canonicalValue(state.drafts[key]))
+      : null;
+    syncDraftFromEditor();
+    storeDraftForDate(editorDate);
+    const next = Object.prototype.hasOwnProperty.call(state.drafts, key)
+      ? JSON.stringify(canonicalValue(state.drafts[key]))
+      : null;
+    return previous === next || persist();
+  }
+
+  function handlePageHide() {
+    return flushEditorDraft();
+  }
+
+  function renderDateRollover() {
+    renderChrome();
+    renderToday();
+    renderTimeline();
+    renderInsights();
+    applyBackground();
+  }
+
+  function ensureEditorDate({ targetDate = currentAppDate(), render = true, announce = true, force = false } = {}) {
+    if (!state.sessionRole || !validISODate(targetDate)) return false;
+    rolloverStorageBlocked = false;
+    if (!editorDate) {
+      loadTodayDraft(targetDate);
+      return false;
+    }
+    if (editorDate === targetDate) return false;
+    if (!force && (journalAction || remoteRefreshInFlight || activeMutations > 0)) return false;
+
+    clearTimeout(draftTimer);
+    draftTimer = null;
+    syncDraftFromEditor();
+    const previousDate = editorDate;
+    const keptPreviousDraft = storeDraftForDate(previousDate);
+    if (keptPreviousDraft && !persist()) {
+      rolloverStorageBlocked = true;
+      showToast("无法保存昨日草稿，请先复制编辑器内容后再刷新");
+      return false;
+    }
+    loadTodayDraft(targetDate);
+    draftRevision += 1;
+    setCheckinStatus();
+    if (render) renderDateRollover();
+    if (announce) showToast(`已进入 ${shortDate(targetDate)}，昨天的内容仍保留在昨天`);
+    return true;
   }
 
   // A background refresh only redraws the active view. It never rebuilds all
@@ -404,13 +640,15 @@
 
   async function refreshRemote({ silent = true } = {}) {
     if (!cloudSession || remoteRefreshInFlight || activeMutations > 0 || document.visibilityState === "hidden") return false;
+    ensureEditorDate();
     remoteRefreshInFlight = true;
     const requestMutationEpoch = mutationEpoch;
     const requestDraftRevision = draftRevision;
     const roleId = state.sessionRole;
-    const todayKey = roleId ? logKey(currentRoomId(), roleId, localISO()) : "";
+    const requestDate = editorDate || currentAppDate();
+    const todayKey = roleId ? logKey(currentRoomId(), roleId, requestDate) : "";
     const ownLogBefore = todayKey ? clone(state.logs[todayKey] || emptyLog()) : emptyLog();
-    const hadUnsavedDraft = hasUnsavedTodayDraft();
+    const hadUnsavedDraft = hasUnsavedDraftForDate(requestDate);
     const draftBeforeRequest = hadUnsavedDraft ? clone(draft) : null;
     try {
       const response = await apiRequest("/api/bootstrap", { method: "GET", headers: {} });
@@ -422,8 +660,34 @@
       const typedDuringRequest = requestDraftRevision !== draftRevision;
       const localDraftToKeep = typedDuringRequest ? clone(draft) : draftBeforeRequest;
       const remoteChanged = remoteStateFingerprint(state) !== remoteStateFingerprint(response.state);
+      const responseDate = currentAppDate();
+
+      // The request may have crossed midnight. Keep the editor snapshot under
+      // the date it was created for, merge the fresh shared state, then open a
+      // new editor for the server's current date. Never carry the old value
+      // into the new date's draft key.
+      if (responseDate !== requestDate) {
+        if (todayKey && localDraftToKeep) {
+          state.drafts[todayKey] = localDraftToKeep;
+          if (!persist()) return false;
+        } else if (todayKey) delete state.drafts[todayKey];
+        if (remoteChanged) mergeRemoteState(response.state, response.role || response.roleId || roleId);
+        const rolled = ensureEditorDate({ targetDate: responseDate, render: false, announce: false, force: true });
+        persist();
+        if (rolled) {
+          renderDateRollover();
+          showToast(`已进入 ${shortDate(responseDate)}，昨天的内容仍保留在昨天`);
+        } else if (remoteChanged) {
+          renderRemoteStateChange({ updateEditor: !hasUnsavedDraftForDate(editorDate) });
+        }
+        return true;
+      }
+
       if (!remoteChanged) {
-        if (todayKey && localDraftToKeep) state.drafts[todayKey] = localDraftToKeep;
+        if (todayKey && localDraftToKeep) {
+          state.drafts[todayKey] = localDraftToKeep;
+          persist();
+        }
         return true;
       }
 
@@ -459,7 +723,19 @@
     refreshTimer = null;
   }
 
-  async function sendCommand(type, payload, { silent = false } = {}) {
+  function startDateChecks() {
+    stopDateChecks();
+    dateCheckTimer = window.setInterval(() => {
+      if (document.visibilityState === "visible") ensureEditorDate();
+    }, 15000);
+  }
+
+  function stopDateChecks() {
+    if (dateCheckTimer) window.clearInterval(dateCheckTimer);
+    dateCheckTimer = null;
+  }
+
+  async function sendCommand(type, payload, { silent = false, throwOnError = false } = {}) {
     if (!cloudSession) return null;
     const commandEpoch = ++mutationEpoch;
     activeMutations += 1;
@@ -482,6 +758,7 @@
         stopRemoteRefresh();
       }
       if (!silent) showToast(error.message || "同步失败，请稍后重试");
+      if (throwOnError) throw error;
       return null;
     } finally {
       activeMutations = Math.max(0, activeMutations - 1);
@@ -497,9 +774,11 @@
         ? state
         : { version: 5, theme: state.theme || "light", sessionRole: null, drafts: state.drafts || {} };
       localStorage.setItem(STORE_KEY, JSON.stringify(value));
+      return true;
     } catch (error) {
       showToast("存储空间不足，请删除较大的图片后重试");
       console.warn("Could not persist prototype data", error);
+      return false;
     }
   }
 
@@ -519,7 +798,7 @@
     return room.members.find((id) => id !== roleId);
   }
 
-  function getLog(roomId, roleId, date = localISO()) {
+  function getLog(roomId, roleId, date = currentAppDate()) {
     return state.logs[logKey(roomId, roleId, date)] || emptyLog();
   }
 
@@ -709,12 +988,14 @@
 
   function enterApp(roleId) {
     state.sessionRole = roleId;
+    editorDate = null;
     persist();
     $("#login-screen").classList.add("is-hidden");
     $("#app-shell").classList.remove("is-hidden");
     currentView = "today";
     insightPerson = roleId;
     renderApp();
+    startDateChecks();
     if (cloudSession) {
       lastRemoteRefreshAt = Date.now();
       startRemoteRefresh();
@@ -754,11 +1035,17 @@
   }
 
   async function logout() {
+    if (!flushEditorDraft()) {
+      const discard = window.confirm("最后输入的草稿无法保存。仍要退出并放弃这部分内容吗？");
+      if (!discard) return;
+    }
     if (cloudSession) {
       try { await apiRequest("/api/logout", { method: "POST", body: "{}" }); } catch { /* local logout still applies */ }
     }
     cloudSession = false;
     stopRemoteRefresh();
+    stopDateChecks();
+    editorDate = null;
     state.sessionRole = null;
     persist();
     if (!canUseLocalFallback()) {
@@ -791,16 +1078,18 @@
     $("#sidebar-name").textContent = role.name;
     setAvatar($("#sidebar-avatar"), role.id);
     setAvatar($("#topbar-avatar"), role.id);
-    $("#today-label").textContent = fullDate(new Date());
+    $("#today-label").textContent = fullDate(currentAppDate());
     $("#view-title").textContent = VIEW_TITLES[currentView];
   }
 
-  function loadTodayDraft() {
+  function loadTodayDraft(date = currentAppDate()) {
     const roomId = currentRoomId();
     const roleId = state.sessionRole;
-    const key = logKey(roomId, roleId, localISO());
-    const savedDraft = state.drafts[key];
-    draft = clone(savedDraft || getLog(roomId, roleId));
+    editorDate = date;
+    const key = logKey(roomId, roleId, editorDate);
+    const localDraft = state.drafts[key];
+    const savedDraft = localDraft && !isLegacyDuplicate(key, localDraft) ? localDraft : null;
+    draft = clone(savedDraft || getLog(roomId, roleId, editorDate));
     draft.images = draft.images || [];
   }
 
@@ -827,6 +1116,161 @@
     renderReaction(partner);
   }
 
+  function recoveryDateFromKey(key) {
+    const prefix = `${currentRoomId()}|${state.sessionRole}|`;
+    return key.startsWith(prefix) ? key.slice(prefix.length) : null;
+  }
+
+  function isRecoveredDuplicate(key, log) {
+    return Object.values(draftRecovery.items || {}).some((item) => item?.recovered && item.key === key
+      && JSON.stringify(canonicalValue(item.log)) === JSON.stringify(canonicalValue(log)));
+  }
+
+  function recoverableDrafts(today = currentAppDate()) {
+    if (!state.sessionRole) return [];
+    const archived = Object.entries(draftRecovery.items || {}).flatMap(([id, item]) => {
+      const date = item?.key ? recoveryDateFromKey(item.key) : null;
+      if (item?.recovered || !validISODate(date) || !hasUnsavedDraftForDate(date, item.log)) return [];
+      return [{ id, source: "recovery", key: item.key, date, log: clone(item.log) }];
+    });
+    const current = Object.entries(state.drafts || {}).flatMap(([key, log]) => {
+      const date = recoveryDateFromKey(key);
+      if (!validISODate(date) || date === today || isLegacyDuplicate(key, log) || isRecoveredDuplicate(key, log)
+        || !hasUnsavedDraftForDate(date, log)) return [];
+      return [{ id: key, source: "state", key, date, log: clone(log) }];
+    });
+    return [...archived, ...current].sort((left, right) => {
+      const leftDistance = Math.abs(parseISO(left.date) - parseISO(today));
+      const rightDistance = Math.abs(parseISO(right.date) - parseISO(today));
+      return leftDistance - rightDistance || right.date.localeCompare(left.date);
+    });
+  }
+
+  function latestRecoverableDraft() {
+    return recoverableDrafts()[0] || null;
+  }
+
+  function renderPreviousDraftNotice() {
+    const notice = $("#previous-draft-notice");
+    if (!notice) return;
+    recoverableDraftRecord = latestRecoverableDraft();
+    notice.classList.toggle("is-hidden", !recoverableDraftRecord);
+    if (recoverableDraftRecord) {
+      $("#previous-draft-title").textContent = `${shortDate(recoverableDraftRecord.date)}还有一份未完成草稿`;
+    }
+  }
+
+  function openPreviousDraft() {
+    renderPreviousDraftNotice();
+    if (!recoverableDraftRecord) {
+      showToast("没有需要恢复的旧草稿");
+      return;
+    }
+    openedRecoverableDraftRecord = clone(recoverableDraftRecord);
+    const source = openedRecoverableDraftRecord.log || emptyLog();
+    $("#previous-draft-dialog-title").textContent = `${shortDate(openedRecoverableDraftRecord.date)}未完成草稿`;
+    const preview = $("#previous-draft-preview");
+    const html = renderLogHTML(source);
+    preview.classList.toggle("empty-journal", !html);
+    preview.innerHTML = html || `<div><strong>草稿没有文字内容</strong><p>可能只留下了评分。</p></div>`;
+    $("#previous-draft-dialog").showModal();
+  }
+
+  function appendDraftText(current, previous) {
+    const left = String(current || "").trim();
+    const right = String(previous || "").trim();
+    if (!right || left.includes(right)) return left;
+    return left ? `${left}\n\n${right}` : right;
+  }
+
+  function mergeRecoverableDraft(target, source) {
+    const mergedDraft = clone(target || emptyLog());
+    const sourceDraft = source || emptyLog();
+    const scoreConflicts = [];
+    mergedDraft.growthText = appendDraftText(mergedDraft.growthText, sourceDraft.growthText);
+    mergedDraft.lifeText = appendDraftText(mergedDraft.lifeText, sourceDraft.lifeText);
+    ["growthScore", "lifeScore"].forEach((field) => {
+      const targetScore = Number(mergedDraft[field] || 0);
+      const sourceScore = Number(sourceDraft[field] || 0);
+      if (targetScore > 0 && sourceScore > 0 && targetScore !== sourceScore) {
+        scoreConflicts.push(field);
+      } else if (!targetScore) {
+        mergedDraft[field] = sourceScore;
+      }
+    });
+    const mergedImages = [];
+    const skippedImages = [];
+    const seenImages = new Set();
+    [...(mergedDraft.images || []), ...(sourceDraft.images || [])].forEach((image) => {
+      const identity = mediaIdentity(image);
+      if (seenImages.has(identity)) return;
+      seenImages.add(identity);
+      if (mergedImages.length < MAX_LOG_IMAGES) mergedImages.push(image);
+      else skippedImages.push(image);
+    });
+    mergedDraft.images = mergedImages;
+    return { mergedDraft, scoreConflicts, skippedImages };
+  }
+
+  function markDraftRecovered(record) {
+    const next = clone(draftRecovery);
+    if (record.source === "recovery" && next.items[record.id]) {
+      next.items[record.id].recovered = true;
+    } else {
+      const archiveId = `recovered:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+      next.items[archiveId] = { key: record.key, log: clone(record.log), recovered: true, kind: "archived" };
+    }
+    if (!persistDraftRecovery(next)) return false;
+    draftRecovery = next;
+    if (record.source === "state") {
+      delete state.drafts[record.key];
+      persist();
+    }
+    return true;
+  }
+
+  function copyPreviousDraftToToday({ fromDialog = false } = {}) {
+    const record = fromDialog ? openedRecoverableDraftRecord : latestRecoverableDraft();
+    if (!record) {
+      showToast("没有需要恢复的旧草稿");
+      return;
+    }
+    ensureEditorDate();
+    if (editorDate !== currentAppDate()) {
+      showToast(rolloverStorageBlocked ? "无法保存旧草稿，请先复制当前编辑器内容" : "正在切换到今天，请稍后再试");
+      return;
+    }
+    const source = record.log;
+    syncDraftFromEditor();
+    const { mergedDraft, scoreConflicts, skippedImages } = mergeRecoverableDraft(draft, source);
+    const targetKey = logKey(currentRoomId(), state.sessionRole, editorDate);
+    const previousTargetDraft = state.drafts[targetKey] ? clone(state.drafts[targetKey]) : null;
+    state.drafts[targetKey] = clone(mergedDraft);
+    if (!persist()) {
+      if (previousTargetDraft) state.drafts[targetKey] = previousTargetDraft;
+      else delete state.drafts[targetKey];
+      showToast("无法安全复制草稿，请稍后重试");
+      return;
+    }
+    draft = mergedDraft;
+    const hasScoreConflict = scoreConflicts.length > 0;
+    const hasSkippedImages = skippedImages.length > 0;
+    const recoveryMarked = hasScoreConflict || hasSkippedImages ? false : markDraftRecovered(record);
+    draftRevision += 1;
+    renderToday();
+    $("#previous-draft-dialog").close();
+    openedRecoverableDraftRecord = null;
+    showToast(hasScoreConflict && hasSkippedImages
+      ? `可复制内容已合并；评分冲突，且有 ${skippedImages.length} 张图片超过 6 张上限，旧草稿仍保留`
+      : hasScoreConflict
+      ? `文字已复制；${shortDate(record.date)}的评分与今天冲突，旧草稿仍保留`
+      : hasSkippedImages
+      ? `可复制内容已合并；有 ${skippedImages.length} 张图片超过 6 张上限，旧草稿仍保留`
+      : recoveryMarked
+        ? `已将 ${shortDate(record.date)}的草稿复制到今天`
+        : "内容已复制，但旧草稿状态未能更新；它仍会保留");
+  }
+
   function renderToday({ preserveEditor = false } = {}) {
     renderPairSummary();
     renderEditorIdentity();
@@ -837,6 +1281,7 @@
       renderScorePicker($("#life-score"), "lifeScore", draft.lifeScore || 0);
     }
     renderPartnerPanel();
+    renderPreviousDraftNotice();
     if (!preserveEditor) setEditorMode(editorMode, { saveDraft: false });
     setJournalActionState(journalAction);
   }
@@ -904,18 +1349,24 @@
 
   function scheduleDraftSave() {
     clearTimeout(draftTimer);
+    const scheduledDate = editorDate;
+    const scheduledRole = state.sessionRole;
+    const scheduledRoom = currentRoomId();
+    const scheduledRevision = draftRevision;
+    const scheduledDraft = clone(draft);
     draftTimer = setTimeout(() => {
-      const key = logKey(currentRoomId(), state.sessionRole, localISO());
+      draftTimer = null;
+      if (!scheduledDate || scheduledRole !== state.sessionRole || scheduledRevision !== draftRevision) return;
+      const key = logKey(scheduledRoom, scheduledRole, scheduledDate);
       // A save can finish before this debounce fires. Do not resurrect a
       // draft that is already identical to the committed log.
-      if (hasUnsavedTodayDraft()) state.drafts[key] = clone(draft);
+      if (hasUnsavedDraftForDate(scheduledDate, scheduledDraft)) state.drafts[key] = scheduledDraft;
       else delete state.drafts[key];
       persist();
-      draftTimer = null;
     }, 350);
   }
 
-  function applyScoreDelta(roomId, roleId, delta) {
+  function applyScoreDelta(roomId, roleId, delta, { notify = true } = {}) {
     const wallet = getWallet(roomId, roleId);
     const previousEarned = wallet.earnedStars;
     const minimumLifetime = wallet.spentStars * 100;
@@ -924,12 +1375,26 @@
     wallet.earnedStars = Math.floor(wallet.lifetimePoints / 100);
     wallet.stars = Math.max(0, wallet.earnedStars - wallet.spentStars);
     wallet.pointsToNextStar = wallet.points === 0 ? 100 : 100 - wallet.points;
-    if (wallet.earnedStars > previousEarned) showToast("满 100 分，获得了一颗新的 Star ★");
+    const earnedStar = wallet.earnedStars > previousEarned;
+    if (earnedStar && notify) showToast("满 100 分，获得了一颗新的 Star ★");
+    return earnedStar;
   }
 
   async function saveToday({ showSuccess = true, showFailure = true } = {}) {
+    const businessDate = currentAppDate();
+    if (editorDate !== businessDate) {
+      ensureEditorDate({ targetDate: businessDate, force: true });
+      if (editorDate !== businessDate) {
+        if (showFailure) showToast("无法保存昨日草稿，请先复制编辑器内容后再刷新");
+        return { ok: false, date: editorDate, reason: "rollover-blocked" };
+      }
+      if (showFailure) showToast("已进入新的一天，请填写今天的记录后再保存");
+      return { ok: false, date: businessDate, reason: "day-rolled" };
+    }
+
     clearTimeout(draftTimer);
     draftTimer = null;
+    syncDraftFromEditor();
     // Take an immutable snapshot for this request. The textarea can still be
     // edited while the network request is in flight; those newer keystrokes
     // must remain a draft instead of being accidentally committed as part of
@@ -939,10 +1404,10 @@
       ...draft,
       growthText: $("#growth-text").value.trim(),
       lifeText: $("#life-text").value.trim(),
-      updatedAt: new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date()),
+      updatedAt: currentAppTimeLabel(),
       images: Array.isArray(draft.images) ? [...draft.images] : [],
     });
-    const today = localISO();
+    const today = editorDate;
     const roomId = currentRoomId();
     const key = logKey(roomId, state.sessionRole, today);
     const previous = state.logs[key] || emptyLog();
@@ -950,14 +1415,32 @@
     const newScore = (submittedLog.growthScore || 0) + (submittedLog.lifeScore || 0);
     let preserveEditorAfterSave = false;
     if (cloudSession) {
-      const response = await sendCommand("save_log", {
-        date: today,
-        growthText: submittedLog.growthText,
-        lifeText: submittedLog.lifeText,
-        growthScore: submittedLog.growthScore || 0,
-        lifeScore: submittedLog.lifeScore || 0,
-        images: submittedLog.images,
-      }, { silent: true });
+      let response;
+      try {
+        response = await sendCommand("save_log", {
+          date: today,
+          growthText: submittedLog.growthText,
+          lifeText: submittedLog.lifeText,
+          growthScore: submittedLog.growthScore || 0,
+          lifeScore: submittedLog.lifeScore || 0,
+          images: submittedLog.images,
+        }, { silent: true, throwOnError: true });
+      } catch (error) {
+        syncDraftFromEditor();
+        storeDraftForDate(today);
+        persist();
+        if (error.code === "LOG_DATE_MISMATCH") {
+          const nextDate = validISODate(error.details?.appDate) ? error.details.appDate : currentAppDate();
+          ensureEditorDate({ targetDate: nextDate, force: true });
+          if (editorDate !== nextDate) {
+            return { ok: false, date: today, reason: "rollover-blocked", error };
+          }
+          if (showFailure) showToast("已进入新的一天，昨天的内容仍保留在昨天");
+          return { ok: false, date: today, reason: "date-mismatch", error };
+        }
+        if (showFailure) showToast("今日记录保存失败，请稍后重试");
+        return { ok: false, date: today, reason: "save-failed", error };
+      }
       if (!response) {
         state.drafts[key] = clone(draft);
         persist();
@@ -986,25 +1469,67 @@
       state.logs[key] = savedLog;
       if (editedDuringSave) state.drafts[key] = clone(draft);
       else delete state.drafts[key];
-      persist();
-      if (!editedDuringSave) draft = clone(savedLog);
+      const savedLocally = persist();
+      if (editedDuringSave && !savedLocally) {
+        return {
+          ok: false,
+          date: today,
+          log: clone(savedLog),
+          reason: "draft-storage-failed",
+          committed: true,
+        };
+      }
+      if (!editedDuringSave) {
+        draft = clone(savedLog);
+        $("#growth-text").value = savedLog.growthText || "";
+        $("#life-text").value = savedLog.lifeText || "";
+      }
     }
     if (!cloudSession) {
+      const previousLog = Object.prototype.hasOwnProperty.call(state.logs, key) ? clone(state.logs[key]) : null;
+      const previousDraft = Object.prototype.hasOwnProperty.call(state.drafts, key) ? clone(state.drafts[key]) : null;
+      const walletStateKey = walletKey(roomId, state.sessionRole);
+      const previousWallet = clone(state.wallets[walletStateKey] || {});
       state.logs[key] = clone(submittedLog);
       delete state.drafts[key];
-      applyScoreDelta(roomId, state.sessionRole, newScore - oldScore);
-      persist();
+      const earnedStar = applyScoreDelta(roomId, state.sessionRole, newScore - oldScore, { notify: false });
+      if (!persist()) {
+        if (previousLog) state.logs[key] = previousLog;
+        else delete state.logs[key];
+        if (previousDraft) state.drafts[key] = previousDraft;
+        else delete state.drafts[key];
+        state.wallets[walletStateKey] = previousWallet;
+        if (showFailure) showToast("本机存储失败，记录尚未保存");
+        return { ok: false, date: today, log: submittedLog, reason: "local-storage-failed" };
+      }
+      if (earnedStar) showToast("满 100 分，获得了一颗新的 Star ★");
     }
     if (!cloudSession) {
       draft = clone(getLog(roomId, state.sessionRole, today));
       draft.images = draft.images || [];
+    }
+    const shouldRollToNextDate = currentAppDate() !== today;
+    const rolledToNextDate = shouldRollToNextDate
+      && ensureEditorDate({ targetDate: currentAppDate(), force: true });
+    if (shouldRollToNextDate && editorDate !== currentAppDate()) {
+      return {
+        ok: false,
+        date: today,
+        log: clone(state.logs[key] || submittedLog),
+        reason: "rollover-blocked",
+        committed: true,
+      };
     }
     draftRevision += 1;
     renderToday({ preserveEditor: preserveEditorAfterSave });
     renderTimeline();
     renderInsights();
     renderStars();
-    if (showSuccess) showToast(cloudSession ? "今日记录已同步" : "今日记录已保存");
+    if (showSuccess) {
+      showToast(rolledToNextDate
+        ? `记录已保存到 ${savedDateLabel(today)}，现在是新的一天`
+        : cloudSession ? "今日记录已同步" : "今日记录已保存");
+    }
     return { ok: true, date: today, log: clone(state.logs[key] || submittedLog) };
   }
 
@@ -1015,8 +1540,21 @@
     try {
       const result = await saveToday({ showSuccess: true, showFailure: false });
       if (!result.ok) {
-        setCheckinStatus("今日记录保存失败，请稍后重试", "error");
-        showToast("今日记录保存失败，请稍后重试");
+        const storageBlocked = result.reason === "rollover-blocked";
+        const draftStorageFailed = result.reason === "draft-storage-failed";
+        const localStorageFailed = result.reason === "local-storage-failed";
+        const crossedDay = ["day-rolled", "date-mismatch"].includes(result.reason);
+        const message = localStorageFailed
+          ? "本机存储失败，记录尚未保存，请先复制编辑器内容"
+          : draftStorageFailed
+          ? "点击时的记录已同步，但随后编辑的内容无法保存为草稿，请先复制编辑器内容"
+          : storageBlocked
+          ? "无法保存昨日草稿，请先复制编辑器内容后再刷新"
+          : crossedDay
+          ? "已进入新的一天，昨天的内容仍保留在昨天；请填写今天的记录"
+          : "今日记录保存失败，请稍后重试";
+        setCheckinStatus(message, crossedDay ? "" : "error");
+        showToast(message);
       }
     } finally {
       setJournalActionState();
@@ -1172,16 +1710,34 @@
     setJournalActionState("checkin");
     const roleId = state.sessionRole;
     let recordSaved = false;
-    let checkinDate = localISO();
+    let checkinDate = editorDate || currentAppDate();
     try {
       const saveResult = await saveToday({ showSuccess: false, showFailure: false });
       if (!saveResult.ok) {
-        setCheckinStatus("记录保存失败，未发送通知", "error");
-        showToast("记录保存失败，未发送通知");
+        const storageBlocked = saveResult.reason === "rollover-blocked";
+        const draftStorageFailed = saveResult.reason === "draft-storage-failed";
+        const localStorageFailed = saveResult.reason === "local-storage-failed";
+        const crossedDay = ["day-rolled", "date-mismatch"].includes(saveResult.reason);
+        const message = localStorageFailed
+          ? "本机存储失败，记录尚未保存；本次未发送通知"
+          : draftStorageFailed
+          ? "记录已同步，但随后编辑的内容无法保存为草稿；本次未发送通知"
+          : storageBlocked
+          ? "无法保存昨日草稿，请先复制编辑器内容；本次未发送通知"
+          : crossedDay
+          ? "已进入新的一天，昨天的内容仍保留在昨天；本次未发送通知"
+          : "记录保存失败，未发送通知";
+        setCheckinStatus(message, crossedDay ? "" : "error");
+        showToast(message);
         return;
       }
       recordSaved = true;
       checkinDate = saveResult.date;
+      if (checkinDate !== currentAppDate()) {
+        setCheckinStatus(`记录已保存到 ${savedDateLabel(checkinDate)}，但已经进入新的一天；本次未发送通知`);
+        showToast("记录已保留在昨天，本次未发送通知");
+        return;
+      }
       const pending = rememberPendingCheckin(roleId, checkinDate);
       if (pending.reused) {
         setCheckinStatus("正在确认上一次打卡结果，请勿重复点击…");
@@ -1223,29 +1779,45 @@
   }
 
   function renderReaction(targetRoleId) {
-    const key = `${currentRoomId()}|${targetRoleId}|${localISO()}`;
+    const reactionDate = currentAppDate();
+    const key = `${currentRoomId()}|${targetRoleId}|${reactionDate}`;
     const record = state.reactions[key] || { count: 0, by: [] };
     const active = record.by.includes(state.sessionRole);
     $("#reaction-count").textContent = record.count;
     $("#reaction-button").classList.toggle("is-active", active);
     $("#reaction-button").firstChild.textContent = active ? "♥ " : "♡ ";
     $("#reaction-button").onclick = async () => {
+      if (journalAction || activeMutations > 0 || remoteRefreshInFlight) {
+        showToast("正在同步，请稍后再回应");
+        return;
+      }
+      const actionDate = currentAppDate();
+      ensureEditorDate({ targetDate: actionDate });
+      if (editorDate !== actionDate) {
+        showToast("日期正在切换，请稍后再回应");
+        return;
+      }
       if (cloudSession) {
-        const response = await sendCommand("toggle_reaction", { targetRoleId, date: localISO() });
+        const response = await sendCommand("toggle_reaction", { targetRoleId, date: actionDate });
         if (response) {
+          ensureEditorDate({ force: true });
           renderToday({ preserveEditor: true });
           return;
         }
+        ensureEditorDate({ targetDate: currentAppDate(), force: true });
         return;
       }
-      if (active) {
-        record.by = record.by.filter((id) => id !== state.sessionRole);
-        record.count = Math.max(0, record.count - 1);
+      const actionKey = `${currentRoomId()}|${targetRoleId}|${actionDate}`;
+      const actionRecord = state.reactions[actionKey] || { count: 0, by: [] };
+      const actionActive = actionRecord.by.includes(state.sessionRole);
+      if (actionActive) {
+        actionRecord.by = actionRecord.by.filter((id) => id !== state.sessionRole);
+        actionRecord.count = Math.max(0, actionRecord.count - 1);
       } else {
-        record.by.push(state.sessionRole);
-        record.count += 1;
+        actionRecord.by.push(state.sessionRole);
+        actionRecord.count += 1;
       }
-      state.reactions[key] = record;
+      state.reactions[actionKey] = actionRecord;
       persist();
       renderReaction(targetRoleId);
     };
@@ -1323,7 +1895,7 @@
       const [roomId, roleId, date] = key.split("|");
       if (roomId !== room.id || !room.members.includes(roleId)) return;
       const visibleText = timelineFilter === "growth" ? log.growthText : timelineFilter === "life" ? log.lifeText : `${log.growthText || ""}${log.lifeText || ""}`;
-      if (visibleText && parseISO(date) <= new Date()) allDates.add(date);
+      if (visibleText && date <= currentAppDate()) allDates.add(date);
     });
     const dates = [...allDates].sort().reverse().slice(0, 12);
     if (!dates.length) {
@@ -1365,8 +1937,9 @@
 
   function calculateStreak(roomId, roleId) {
     let streak = 0;
+    const today = parseISO(currentAppDate());
     for (let offset = 0; offset > -365; offset -= 1) {
-      const log = getLog(roomId, roleId, localISO(addDays(new Date(), offset)));
+      const log = getLog(roomId, roleId, localISO(addDays(today, offset)));
       if ((log.growthScore || 0) + (log.lifeScore || 0) > 0) streak += 1;
       else if (offset === 0) continue;
       else break;
@@ -1398,7 +1971,7 @@
       tabs.appendChild(button);
     });
 
-    const weekStart = startOfWeek(new Date());
+    const weekStart = startOfWeek(parseISO(currentAppDate()));
     const thisWeek = logsForRange(room.id, insightPerson, weekStart, 7);
     const previousWeek = logsForRange(room.id, insightPerson, addDays(weekStart, -7), 7);
     const growth = thisWeek.reduce((sum, item) => sum + (item.log.growthScore || 0), 0);
@@ -1454,7 +2027,7 @@
       const growth = Number(log.growthScore || 0);
       const life = Number(log.lifeScore || 0);
       const total = growth + life;
-      const isToday = localISO(date) === localISO();
+      const isToday = localISO(date) === currentAppDate();
       return `
         <div class="week-column${isToday ? " is-today" : ""}">
           <div class="bar-stage">
@@ -1569,7 +2142,7 @@
       to: partnerId(),
       text,
       status: "pending",
-      createdAt: localISO()
+      createdAt: currentAppDate()
     });
     $("#wish-text").value = "";
     persist();
@@ -1578,10 +2151,12 @@
   }
 
   function navigate(view, shouldScroll = true) {
+    if (view === "today") ensureEditorDate();
     currentView = view;
     $$(".view").forEach((element) => element.classList.toggle("is-active", element.id === `view-${view}`));
     $$('[data-view]').forEach((button) => button.classList.toggle("is-active", button.dataset.view === view));
     $("#view-title").textContent = VIEW_TITLES[view];
+    if (view === "today") renderToday({ preserveEditor: true });
     if (view === "timeline") renderTimeline();
     if (view === "insights") renderInsights();
     if (view === "stars") renderStars();
@@ -1674,6 +2249,7 @@
   }
 
   function bindEvents() {
+    window.addEventListener("pagehide", handlePageHide);
     $("#login-form").addEventListener("submit", (event) => {
       event.preventDefault();
       const entered = $("#password").value;
@@ -1689,6 +2265,13 @@
     $$("#editor-mode-toggle button").forEach((button) => button.addEventListener("click", () => setEditorMode(button.dataset.mode)));
     $("#save-log").addEventListener("click", handleSaveToday);
     $("#checkin-notify").addEventListener("click", checkinAndNotify);
+    $("#view-previous-draft").addEventListener("click", openPreviousDraft);
+    $("#copy-previous-draft").addEventListener("click", () => copyPreviousDraftToToday());
+    $("#copy-previous-draft-dialog").addEventListener("click", () => copyPreviousDraftToToday({ fromDialog: true }));
+    $("#close-previous-draft").addEventListener("click", () => {
+      openedRecoverableDraftRecord = null;
+      $("#previous-draft-dialog").close();
+    });
     $("#avatar-image").addEventListener("change", (event) => handleImageUpload(event.target, "avatar"));
     $("#background-image").addEventListener("change", (event) => handleImageUpload(event.target, "background"));
     $("#wish-form").addEventListener("submit", createWish);
@@ -1728,8 +2311,30 @@
   async function init() {
     applyTheme();
     renderLoginPreview();
+    initializeDraftRecovery();
     if (!canUseLocalFallback()) $("#local-demo-note")?.remove();
     bindEvents();
+    if (crossDayTestClock && canUseLocalFallback()) {
+      const button = document.createElement("button");
+      const status = document.createElement("output");
+      button.type = "button";
+      button.textContent = "测试：进入下一天";
+      button.addEventListener("click", () => {
+        const previousDate = editorDate;
+        crossDayTestOffset += 24 * 60 * 60 * 1000;
+        const rolled = ensureEditorDate();
+        const previousKey = previousDate && state.sessionRole
+          ? logKey(currentRoomId(), state.sessionRole, previousDate)
+          : "";
+        status.textContent = JSON.stringify({
+          rolled,
+          previousDate,
+          nextDate: editorDate,
+          oldDraftKept: Boolean(previousKey && state.drafts[previousKey]),
+        });
+      });
+      document.body.append(button, status);
+    }
     // A persisted role is only an offline-preview convenience.  On a hosted
     // build, the HttpOnly cookie must be checked before showing any data.
     if (canUseLocalFallback() && state.sessionRole && state.roles[state.sessionRole]) {
@@ -1737,6 +2342,7 @@
       $("#app-shell").classList.remove("is-hidden");
       insightPerson = state.sessionRole;
       renderApp();
+      startDateChecks();
     } else if (!canUseLocalFallback()) {
       state.sessionRole = null;
       persist();
@@ -1753,9 +2359,22 @@
       }
     }
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "visible" && cloudSession && Date.now() - lastRemoteRefreshAt > 1500) {
+      if (document.visibilityState !== "visible") return;
+      const rolled = ensureEditorDate();
+      if (cloudSession && (rolled || Date.now() - lastRemoteRefreshAt > 1500)) {
         refreshRemote({ silent: true });
       }
+    });
+    window.addEventListener("focus", () => {
+      const rolled = ensureEditorDate();
+      if (cloudSession && (rolled || Date.now() - lastRemoteRefreshAt > 1500)) {
+        refreshRemote({ silent: true });
+      }
+    });
+    window.addEventListener("pageshow", (event) => {
+      if (!event.persisted) return;
+      ensureEditorDate();
+      if (cloudSession) refreshRemote({ silent: true });
     });
   }
 

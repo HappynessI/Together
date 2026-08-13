@@ -360,6 +360,13 @@ textarea::placeholder, input::placeholder { color: var(--faint); }
 .person-line small { color: var(--muted); }
 .status-dot { color: var(--muted); font-size: 11px; }
 .status-dot i { display: inline-block; width: 6px; height: 6px; margin-right: 5px; border-radius: 50%; background: var(--green); }
+.previous-draft-notice { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-top: 14px; padding: 12px 14px; border: 1px solid rgba(181,137,0,.28); border-radius: 13px; background: rgba(181,137,0,.08); }
+.previous-draft-notice > div:first-child { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.previous-draft-notice strong { font-size: 12px; }
+.previous-draft-notice span, .previous-draft-dialog-footer small { color: var(--muted); font-size: 11px; line-height: 1.45; }
+.previous-draft-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 8px; }
+.previous-draft-preview { max-height: min(58vh, 560px); min-height: 180px; overflow: auto; padding: 4px 2px 8px; }
+.previous-draft-dialog-footer { align-items: center; gap: 18px; }
 
 .track-editor { padding: 19px 0 0; }
 .track-editor + .track-editor { margin-top: 3px; padding-top: 18px; border-top: 1px dashed var(--border); }
@@ -572,6 +579,8 @@ textarea::placeholder, input::placeholder { color: var(--faint); }
   .score-rubric-scale { grid-template-columns: repeat(3, minmax(0, 1fr)); width: 100%; }
   .journal-panel { padding: 15px; border-radius: 20px; }
   .status-dot { display: none; }
+  .previous-draft-notice { align-items: stretch; flex-direction: column; }
+  .previous-draft-actions { justify-content: flex-end; }
   .editor-header-actions { margin-left: 10px; }
   .track-heading { align-items: flex-start; flex-direction: column; }
   .score-picker { width: 100%; justify-content: space-between; }

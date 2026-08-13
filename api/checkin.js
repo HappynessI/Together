@@ -1,14 +1,14 @@
 import {
   HttpError,
   ROOM_ID,
-  dateInTimezone,
+  appTimeMetadata,
+  assertCurrentAppDate,
   getSupabase,
   methodNotAllowed,
   readJsonBody,
   requireSession,
   sendJson,
   throwIfSupabaseError,
-  validateDate,
   withApiHandler,
 } from "../lib/server.js";
 import {
@@ -109,11 +109,10 @@ export default withApiHandler(async (req, res) => {
   if (req.method !== "POST") methodNotAllowed(res, ["POST"]);
   const { roleId } = requireSession(req);
   const body = await readJsonBody(req, 16 * 1024);
-  const today = dateInTimezone();
-  const date = validateDate(body.date, today);
-  if (date !== today) {
-    throw new HttpError(409, "CHECKIN_DATE_MISMATCH", "当前日期已经变化，请刷新页面后再打卡。");
-  }
+  const date = assertCurrentAppDate(body.date, {
+    code: "CHECKIN_DATE_MISMATCH",
+    message: "当前日期已经变化，请刷新页面后再打卡。",
+  });
   const idempotencyKey = String(body.idempotencyKey || "").trim();
   if (!UUID_V4.test(idempotencyKey)) {
     throw new HttpError(400, "INVALID_IDEMPOTENCY_KEY", "打卡请求编号无效。");
@@ -140,7 +139,7 @@ export default withApiHandler(async (req, res) => {
 
   const existing = handleExistingReservation(reservation, date);
   if (existing) {
-    sendJson(res, 200, existing);
+    sendJson(res, 200, { ...existing, ...appTimeMetadata() });
     return;
   }
   if (reservation?.action !== "send") {
@@ -223,5 +222,6 @@ export default withApiHandler(async (req, res) => {
     alreadySent: false,
     quote: result.quote,
     sentAt: result.sentAt,
+    ...appTimeMetadata(),
   });
 });

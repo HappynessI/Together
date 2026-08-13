@@ -1,5 +1,6 @@
 import {
   HttpError,
+  appTimeMetadata,
   checkLoginRateLimit,
   clearLoginRateLimit,
   identifyRoleByPassword,
@@ -24,5 +25,5 @@ export default withApiHandler(async (req, res) => {
 
   setSessionCookie(req, res, roleId);
   const state = await loadState(roleId);
-  sendJson(res, 200, { ok: true, role: roleId, roleId, state });
+  sendJson(res, 200, { ok: true, role: roleId, roleId, state, ...appTimeMetadata() });
 });
