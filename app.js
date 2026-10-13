@@ -4,6 +4,23 @@
   const STORE_KEY = "pair-journal-prototype-v5";
   const CHECKIN_PENDING_STORE_KEY = "pair-journal-checkin-pending-v1";
   const DRAFT_RECOVERY_STORE_KEY = "pair-journal-draft-recovery-v2";
+  // 主题风格是本机偏好，独立于 STORE_KEY 保存；没有记录时一律使用 Solarized。
+  const THEME_STYLE_STORE_KEY = "pair-journal-theme-style-v1";
+  const DEFAULT_THEME_STYLE = "solarized";
+  const THEME_STYLES = {
+    solarized: {
+      description: "Solarized：暖色纸张与青色点缀，只保存在这台设备",
+      themeColor: { light: "#fdf6e3", dark: "#002b36" },
+    },
+    paper: {
+      description: "素笺：低饱和米白与宋体标题，行距更宽松，只保存在这台设备",
+      themeColor: { light: "#f6f4ef", dark: "#1b1a18" },
+    },
+    claude: {
+      description: "Claude：暖米色纸面、陶土橙点缀与衬线标题，只保存在这台设备",
+      themeColor: { light: "#f5f4ed", dark: "#262624" },
+    },
+  };
   const MAX_LOG_IMAGES = 6;
   const PASSWORDS = { me: "solarized", partner: "bluebird" };
   const VIEW_TITLES = {
@@ -301,7 +318,7 @@
 
   function isLegacyDuplicate(key, log) {
     const legacy = legacyRecoveryForKey(key);
-    return Boolean(legacy && JSON.stringify(canonicalValue(legacy.log)) === JSON.stringify(canonicalValue(log)));
+    return Boolean(legacy && sameValue(legacy.log, log));
   }
 
   if (new URLSearchParams(window.location.search).has("reset-demo")) {
@@ -311,6 +328,7 @@
   }
 
   let state = loadState();
+  let themeStyle = loadThemeStyle();
   let currentView = "today";
   let timelineFilter = "all";
   let insightPerson = "me";
@@ -319,6 +337,8 @@
   let draftTimer = null;
   let toastTimer = null;
   let cloudSession = false;
+  // 云端会话失效后，任何操作都不能退回到只改本机副本的离线逻辑。
+  let sessionExpired = false;
   let refreshTimer = null;
   let remoteRefreshInFlight = false;
   let mutationEpoch = 0;
@@ -345,6 +365,7 @@
   const localPreviewHost = new Set(["localhost", "127.0.0.1", "0.0.0.0", "[::1]"]);
   const canUseLocalFallback = () => window.location.protocol === "file:"
     || localPreviewHost.has(window.location.hostname);
+  const usesLocalData = () => !cloudSession && !sessionExpired && canUseLocalFallback();
 
   class ApiError extends Error {
     constructor(message, status = 0, code = "API_ERROR", details = null) {
@@ -477,6 +498,10 @@
     }, {});
   }
 
+  function sameValue(left, right) {
+    return JSON.stringify(canonicalValue(left)) === JSON.stringify(canonicalValue(right));
+  }
+
   function remoteStateFingerprint(source) {
     const roles = Object.fromEntries(Object.entries(source?.roles || {}).map(([roleId, role]) => [
       roleId,
@@ -569,15 +594,10 @@
     draftTimer = null;
     if (!editorDate || !state.sessionRole) return true;
     const key = logKey(currentRoomId(), state.sessionRole, editorDate);
-    const previous = Object.prototype.hasOwnProperty.call(state.drafts, key)
-      ? JSON.stringify(canonicalValue(state.drafts[key]))
-      : null;
+    const previous = state.drafts[key] ?? null;
     syncDraftFromEditor();
     storeDraftForDate(editorDate);
-    const next = Object.prototype.hasOwnProperty.call(state.drafts, key)
-      ? JSON.stringify(canonicalValue(state.drafts[key]))
-      : null;
-    return previous === next || persist();
+    return sameValue(previous, state.drafts[key] ?? null) || persist();
   }
 
   function handlePageHide() {
@@ -692,7 +712,7 @@
       }
 
       const ownLogAfter = todayKey ? clone(response.state?.logs?.[todayKey] || emptyLog()) : emptyLog();
-      const ownSavedLogChanged = JSON.stringify(canonicalValue(ownLogBefore)) !== JSON.stringify(canonicalValue(ownLogAfter));
+      const ownSavedLogChanged = !sameValue(ownLogBefore, ownLogAfter);
       mergeRemoteState(response.state, response.role || response.roleId || roleId);
       if (todayKey && localDraftToKeep) state.drafts[todayKey] = localDraftToKeep;
       else if (todayKey) delete state.drafts[todayKey];
@@ -701,8 +721,8 @@
       return true;
     } catch (error) {
       if (error.status === 401) {
-        cloudSession = false;
-        stopRemoteRefresh();
+        handleSessionExpired();
+        return false;
       }
       if (!silent) showToast(error.message || "同步失败");
       return false;
@@ -735,33 +755,41 @@
     dateCheckTimer = null;
   }
 
-  async function sendCommand(type, payload, { silent = false, throwOnError = false } = {}) {
-    if (!cloudSession) return null;
-    const commandEpoch = ++mutationEpoch;
+  // 写请求进行期间暂停后台同步和跨日切换，避免旧的读取结果覆盖刚写入的数据。
+  async function withMutation(task) {
     activeMutations += 1;
     try {
-      const response = await apiRequest("/api/command", {
-        method: "POST",
-        body: JSON.stringify({ type, payload }),
-      });
-      if (commandEpoch === mutationEpoch) {
-        mergeRemoteState(response.state, state.sessionRole);
-        persist();
-      }
-      return response;
+      return await task();
+    } finally {
+      activeMutations = Math.max(0, activeMutations - 1);
+    }
+  }
+
+  // 会返回共享状态的写请求。只有最后发出的写请求的响应会合并进本地状态；
+  // 更早发出的请求返回时 current 为 false，它携带的状态不再合并。
+  async function sendMutation(path, body) {
+    const epoch = ++mutationEpoch;
+    const response = await withMutation(() => apiRequest(path, { method: "POST", body: JSON.stringify(body) }));
+    const current = epoch === mutationEpoch;
+    if (current) {
+      mergeRemoteState(response.state, state.sessionRole);
+      persist();
+    }
+    return { ...response, current };
+  }
+
+  async function sendCommand(type, payload, { silent = false, throwOnError = false } = {}) {
+    if (!cloudSession) return null;
+    try {
+      return await sendMutation("/api/command", { type, payload });
     } catch (error) {
       // A failed cloud command must not silently mutate a stale local copy.
       // Keep the session alive for transient server errors and let the user
       // retry; local fallback is reserved for the standalone preview.
-      if (error.status === 401) {
-        cloudSession = false;
-        stopRemoteRefresh();
-      }
-      if (!silent) showToast(error.message || "同步失败，请稍后重试");
+      if (error.status === 401) handleSessionExpired();
+      else if (!silent) showToast(error.message || "同步失败，请稍后重试");
       if (throwOnError) throw error;
       return null;
-    } finally {
-      activeMutations = Math.max(0, activeMutations - 1);
     }
   }
 
@@ -890,16 +918,56 @@
     }
   }
 
-  function applyTheme() {
-    document.documentElement.dataset.theme = state.theme;
-    const themeColor = state.theme === "dark" ? "#002b36" : "#fdf6e3";
-    $("meta[name='theme-color']").setAttribute("content", themeColor);
-    $("#theme-toggle").textContent = state.theme === "dark" ? "☀" : "◐";
-    $("#dialog-theme-toggle").textContent = state.theme === "dark" ? "切换到明亮" : "切换到深色";
+  function loadThemeStyle() {
+    try {
+      const value = localStorage.getItem(THEME_STYLE_STORE_KEY);
+      return Object.prototype.hasOwnProperty.call(THEME_STYLES, value) ? value : DEFAULT_THEME_STYLE;
+    } catch {
+      return DEFAULT_THEME_STYLE;
+    }
   }
 
-  function toggleTheme() {
-    state.theme = state.theme === "dark" ? "light" : "dark";
+  // 明暗模式沿用历史字段 state.theme（"light" / "dark"），与 profiles.theme 同步；
+  // 主题风格只保存在本机。两者分别写到 html 的 data-mode 和 data-style 上。
+  function colorMode() {
+    return state.theme === "dark" ? "dark" : "light";
+  }
+
+  function applyTheme() {
+    const mode = colorMode();
+    const root = document.documentElement;
+    root.dataset.mode = mode;
+    root.dataset.style = themeStyle;
+    $("meta[name='theme-color']").setAttribute("content", THEME_STYLES[themeStyle].themeColor[mode]);
+    $("#theme-toggle").textContent = mode === "dark" ? "☀" : "◐";
+    $("#theme-style-description").textContent = THEME_STYLES[themeStyle].description;
+    $$("#theme-style-options [data-theme-style]").forEach((button) => {
+      const active = button.dataset.themeStyle === themeStyle;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-checked", String(active));
+    });
+    $$("#color-mode-options [data-color-mode]").forEach((button) => {
+      const active = button.dataset.colorMode === mode;
+      button.classList.toggle("is-active", active);
+      button.setAttribute("aria-checked", String(active));
+    });
+  }
+
+  function setThemeStyle(value) {
+    if (!Object.prototype.hasOwnProperty.call(THEME_STYLES, value) || value === themeStyle) return;
+    themeStyle = value;
+    applyTheme();
+    try {
+      localStorage.setItem(THEME_STYLE_STORE_KEY, value);
+    } catch (error) {
+      console.warn("Could not persist theme style", error);
+      showToast("本机存储不可用，刷新后会恢复默认主题");
+    }
+  }
+
+  function setColorMode(mode) {
+    if (mode === colorMode()) return;
+    state.theme = mode === "dark" ? "dark" : "light";
     applyTheme();
     persist();
     if (cloudSession) {
@@ -907,6 +975,10 @@
         if (!response && cloudSession) refreshRemote({ silent: true });
       });
     }
+  }
+
+  function toggleColorMode() {
+    setColorMode(colorMode() === "dark" ? "light" : "dark");
   }
 
   function openSettings() {
@@ -955,7 +1027,7 @@
         return;
       }
 
-      if (!canUseLocalFallback()) {
+      if (!usesLocalData()) {
         error.textContent = "请重新登录后再试。";
         return;
       }
@@ -988,6 +1060,7 @@
 
   function enterApp(roleId) {
     state.sessionRole = roleId;
+    sessionExpired = false;
     editorDate = null;
     persist();
     $("#login-screen").classList.add("is-hidden");
@@ -1045,18 +1118,48 @@
     cloudSession = false;
     stopRemoteRefresh();
     stopDateChecks();
-    editorDate = null;
-    state.sessionRole = null;
-    persist();
     if (!canUseLocalFallback()) {
+      editorDate = null;
+      state.sessionRole = null;
+      persist();
       window.location.reload();
       return;
     }
+    showLoginScreen();
+  }
+
+  function showLoginScreen(message = "") {
+    editorDate = null;
+    state.sessionRole = null;
+    persist();
+    $$("dialog[open]").forEach((dialog) => dialog.close());
     $("#app-shell").classList.add("is-hidden");
     $("#login-screen").classList.remove("is-hidden");
     $("#password").value = "";
-    $("#login-error").textContent = "";
+    $("#login-error").textContent = message;
     $("#password").focus();
+  }
+
+  // 会话过期时先把编辑器内容写成本机草稿，再回到登录页；重新登录同一身份后草稿会自动载入。
+  function handleSessionExpired() {
+    if (sessionExpired) return;
+    cloudSession = false;
+    sessionExpired = true;
+    stopRemoteRefresh();
+    stopDateChecks();
+    if (!flushEditorDraft()) {
+      showToast("登录已过期，最后的输入无法保存为草稿，请先复制编辑器内容再重新登录");
+      return;
+    }
+    showLoginScreen("登录已过期，请重新输入密码。未同步的内容已作为本机草稿保留。");
+  }
+
+  // 返回当前可写入的数据来源；会话已过期时提示用户，调用方必须停止操作。
+  function writableSession() {
+    if (cloudSession) return "cloud";
+    if (usesLocalData()) return "local";
+    showToast("登录已过期，请重新登录后再操作");
+    return null;
   }
 
   function renderApp() {
@@ -1123,7 +1226,7 @@
 
   function isRecoveredDuplicate(key, log) {
     return Object.values(draftRecovery.items || {}).some((item) => item?.recovered && item.key === key
-      && JSON.stringify(canonicalValue(item.log)) === JSON.stringify(canonicalValue(log)));
+      && sameValue(item.log, log));
   }
 
   function recoverableDrafts(today = currentAppDate()) {
@@ -1271,12 +1374,19 @@
         : "内容已复制，但旧草稿状态未能更新；它仍会保留");
   }
 
+  // 只在内容确实不同的时候写入 textarea，避免光标跳到末尾。
+  function setEditorText(log) {
+    const growthInput = $("#growth-text");
+    const lifeInput = $("#life-text");
+    if (growthInput.value !== (log.growthText || "")) growthInput.value = log.growthText || "";
+    if (lifeInput.value !== (log.lifeText || "")) lifeInput.value = log.lifeText || "";
+  }
+
   function renderToday({ preserveEditor = false } = {}) {
     renderPairSummary();
     renderEditorIdentity();
     if (!preserveEditor) {
-      $("#growth-text").value = draft.growthText || "";
-      $("#life-text").value = draft.lifeText || "";
+      setEditorText(draft);
       renderScorePicker($("#growth-score"), "growthScore", draft.growthScore || 0);
       renderScorePicker($("#life-score"), "lifeScore", draft.lifeScore || 0);
     }
@@ -1347,6 +1457,13 @@
     }
   }
 
+  // 每次输入都会增加 draftRevision；保存和后台同步依靠它判断请求期间是否又有新输入。
+  function handleEditorInput(field, value) {
+    draft[field] = value;
+    draftRevision += 1;
+    scheduleDraftSave();
+  }
+
   function scheduleDraftSave() {
     clearTimeout(draftTimer);
     const scheduledDate = editorDate;
@@ -1395,6 +1512,13 @@
     clearTimeout(draftTimer);
     draftTimer = null;
     syncDraftFromEditor();
+    const mode = cloudSession ? "cloud" : usesLocalData() ? "local" : null;
+    if (!mode) {
+      storeDraftForDate(editorDate);
+      persist();
+      if (showFailure) showToast("登录已过期，记录尚未保存");
+      return { ok: false, date: editorDate, reason: "session-expired" };
+    }
     // Take an immutable snapshot for this request. The textarea can still be
     // edited while the network request is in flight; those newer keystrokes
     // must remain a draft instead of being accidentally committed as part of
@@ -1414,7 +1538,7 @@
     const oldScore = (previous.growthScore || 0) + (previous.lifeScore || 0);
     const newScore = (submittedLog.growthScore || 0) + (submittedLog.lifeScore || 0);
     let preserveEditorAfterSave = false;
-    if (cloudSession) {
+    if (mode === "cloud") {
       let response;
       try {
         response = await sendCommand("save_log", {
@@ -1429,6 +1553,7 @@
         syncDraftFromEditor();
         storeDraftForDate(today);
         persist();
+        if (error.status === 401) return { ok: false, date: today, reason: "session-expired", error };
         if (error.code === "LOG_DATE_MISMATCH") {
           const nextDate = validISODate(error.details?.appDate) ? error.details.appDate : currentAppDate();
           ensureEditorDate({ targetDate: nextDate, force: true });
@@ -1481,11 +1606,9 @@
       }
       if (!editedDuringSave) {
         draft = clone(savedLog);
-        $("#growth-text").value = savedLog.growthText || "";
-        $("#life-text").value = savedLog.lifeText || "";
+        setEditorText(savedLog);
       }
-    }
-    if (!cloudSession) {
+    } else {
       const previousLog = Object.prototype.hasOwnProperty.call(state.logs, key) ? clone(state.logs[key]) : null;
       const previousDraft = Object.prototype.hasOwnProperty.call(state.drafts, key) ? clone(state.drafts[key]) : null;
       const walletStateKey = walletKey(roomId, state.sessionRole);
@@ -1503,8 +1626,6 @@
         return { ok: false, date: today, log: submittedLog, reason: "local-storage-failed" };
       }
       if (earnedStar) showToast("满 100 分，获得了一颗新的 Star ★");
-    }
-    if (!cloudSession) {
       draft = clone(getLog(roomId, state.sessionRole, today));
       draft.images = draft.images || [];
     }
@@ -1528,9 +1649,31 @@
     if (showSuccess) {
       showToast(rolledToNextDate
         ? `记录已保存到 ${savedDateLabel(today)}，现在是新的一天`
-        : cloudSession ? "今日记录已同步" : "今日记录已保存");
+        : mode === "cloud" ? "今日记录已同步" : "今日记录已保存");
     }
     return { ok: true, date: today, log: clone(state.logs[key] || submittedLog) };
+  }
+
+  const SAVE_FAILURE_MESSAGES = {
+    "local-storage-failed": ["本机存储失败，记录尚未保存，请先复制编辑器内容", "本机存储失败，记录尚未保存；本次未发送通知"],
+    "draft-storage-failed": ["点击时的记录已同步，但随后编辑的内容无法保存为草稿，请先复制编辑器内容", "记录已同步，但随后编辑的内容无法保存为草稿；本次未发送通知"],
+    "rollover-blocked": ["无法保存昨日草稿，请先复制编辑器内容后再刷新", "无法保存昨日草稿，请先复制编辑器内容；本次未发送通知"],
+    "day-rolled": ["已进入新的一天，昨天的内容仍保留在昨天；请填写今天的记录", "已进入新的一天，昨天的内容仍保留在昨天；本次未发送通知"],
+    "date-mismatch": ["已进入新的一天，昨天的内容仍保留在昨天；请填写今天的记录", "已进入新的一天，昨天的内容仍保留在昨天；本次未发送通知"],
+    "session-expired": ["登录已过期，记录尚未保存。未同步的内容已作为本机草稿保留，请重新输入密码。", "登录已过期，记录尚未保存，本次未发送通知。未同步的内容已作为本机草稿保留，请重新输入密码。"],
+  };
+
+  // 保存和打卡共用同一组失败提示；跨日属于正常提示，其他原因按错误显示。
+  function reportSaveFailure(result, { checkin = false } = {}) {
+    const messages = SAVE_FAILURE_MESSAGES[result.reason];
+    const message = messages ? messages[checkin ? 1 : 0] : checkin ? "记录保存失败，未发送通知" : "今日记录保存失败，请稍后重试";
+    const crossedDay = result.reason === "day-rolled" || result.reason === "date-mismatch";
+    if (result.reason === "session-expired" && !$("#login-screen").classList.contains("is-hidden")) {
+      $("#login-error").textContent = message;
+      return;
+    }
+    setCheckinStatus(message, crossedDay ? "" : "error");
+    showToast(message);
   }
 
   async function handleSaveToday() {
@@ -1539,23 +1682,7 @@
     setJournalActionState("save");
     try {
       const result = await saveToday({ showSuccess: true, showFailure: false });
-      if (!result.ok) {
-        const storageBlocked = result.reason === "rollover-blocked";
-        const draftStorageFailed = result.reason === "draft-storage-failed";
-        const localStorageFailed = result.reason === "local-storage-failed";
-        const crossedDay = ["day-rolled", "date-mismatch"].includes(result.reason);
-        const message = localStorageFailed
-          ? "本机存储失败，记录尚未保存，请先复制编辑器内容"
-          : draftStorageFailed
-          ? "点击时的记录已同步，但随后编辑的内容无法保存为草稿，请先复制编辑器内容"
-          : storageBlocked
-          ? "无法保存昨日草稿，请先复制编辑器内容后再刷新"
-          : crossedDay
-          ? "已进入新的一天，昨天的内容仍保留在昨天；请填写今天的记录"
-          : "今日记录保存失败，请稍后重试";
-        setCheckinStatus(message, crossedDay ? "" : "error");
-        showToast(message);
-      }
+      if (!result.ok) reportSaveFailure(result);
     } finally {
       setJournalActionState();
     }
@@ -1690,6 +1817,10 @@
 
   async function checkinAndNotify() {
     if (journalAction) return;
+    if (!cloudSession && sessionExpired) {
+      writableSession();
+      return;
+    }
     if (!cloudSession) {
       setCheckinStatus("邮件通知仅在共享版可用", "", "availability");
       showToast("邮件通知仅在共享版可用");
@@ -1714,21 +1845,7 @@
     try {
       const saveResult = await saveToday({ showSuccess: false, showFailure: false });
       if (!saveResult.ok) {
-        const storageBlocked = saveResult.reason === "rollover-blocked";
-        const draftStorageFailed = saveResult.reason === "draft-storage-failed";
-        const localStorageFailed = saveResult.reason === "local-storage-failed";
-        const crossedDay = ["day-rolled", "date-mismatch"].includes(saveResult.reason);
-        const message = localStorageFailed
-          ? "本机存储失败，记录尚未保存；本次未发送通知"
-          : draftStorageFailed
-          ? "记录已同步，但随后编辑的内容无法保存为草稿；本次未发送通知"
-          : storageBlocked
-          ? "无法保存昨日草稿，请先复制编辑器内容；本次未发送通知"
-          : crossedDay
-          ? "已进入新的一天，昨天的内容仍保留在昨天；本次未发送通知"
-          : "记录保存失败，未发送通知";
-        setCheckinStatus(message, crossedDay ? "" : "error");
-        showToast(message);
+        reportSaveFailure(saveResult, { checkin: true });
         return;
       }
       recordSaved = true;
@@ -1743,16 +1860,10 @@
         setCheckinStatus("正在确认上一次打卡结果，请勿重复点击…");
       }
 
-      activeMutations += 1;
-      let response;
-      try {
-        response = await apiRequest("/api/checkin", {
-          method: "POST",
-          body: JSON.stringify({ date: checkinDate, idempotencyKey: pending.idempotencyKey }),
-        });
-      } finally {
-        activeMutations = Math.max(0, activeMutations - 1);
-      }
+      const response = await withMutation(() => apiRequest("/api/checkin", {
+        method: "POST",
+        body: JSON.stringify({ date: checkinDate, idempotencyKey: pending.idempotencyKey }),
+      }));
 
       const quote = typeof response.quote === "string" ? response.quote.trim() : "";
       const statusText = quote
@@ -1762,17 +1873,20 @@
       setCheckinStatus(statusText, "success");
       showToast("已打卡，邮件已通知搭档");
     } catch (error) {
-      if (error.status === 401) {
-        cloudSession = false;
-        stopRemoteRefresh();
-      }
       const errorState = recordSaved
         ? checkinErrorState(error, checkinDate)
         : { sent: false, keepKey: false, message: "记录保存失败，未发送通知" };
       if (recordSaved && !errorState.keepKey) clearPendingCheckin(roleId, checkinDate);
+      console.warn("Check-in notification failed", error);
+      if (error.status === 401) {
+        handleSessionExpired();
+        if (!$("#login-screen").classList.contains("is-hidden")) {
+          $("#login-error").textContent = errorState.message;
+          return;
+        }
+      }
       setCheckinStatus(errorState.message, errorState.sent ? "success" : "error");
       showToast(errorState.message);
-      console.warn("Check-in notification failed", error);
     } finally {
       setJournalActionState();
     }
@@ -1797,7 +1911,9 @@
         showToast("日期正在切换，请稍后再回应");
         return;
       }
-      if (cloudSession) {
+      const mode = writableSession();
+      if (!mode) return;
+      if (mode === "cloud") {
         const response = await sendCommand("toggle_reaction", { targetRoleId, date: actionDate });
         if (response) {
           ensureEditorDate({ force: true });
@@ -2090,14 +2206,20 @@
       const button = $(".wish-status", item);
       if (actionable) {
         button.addEventListener("click", async () => {
+          if (button.disabled) return;
           const nextStatus = wish.status === "pending" ? "accepted" : "done";
-          if (cloudSession) {
+          const mode = writableSession();
+          if (!mode) return;
+          if (mode === "cloud") {
+            // 请求期间禁用按钮，连续点击只会提交一次状态变化。
+            button.disabled = true;
             const response = await sendCommand("update_wish", { wishId: wish.id, status: nextStatus });
             if (response) {
               renderStars();
               showToast(nextStatus === "accepted" ? "已接受这个愿望" : "愿望完成，真好 ★");
               return;
             }
+            button.disabled = false;
             return;
           }
           wish.status = nextStatus;
@@ -2112,6 +2234,8 @@
 
   async function createWish(event) {
     event.preventDefault();
+    const submitButton = $("#wish-form button[type='submit']");
+    if (submitButton.disabled) return;
     const text = $("#wish-text").value.trim();
     const error = $("#wish-error");
     error.textContent = "";
@@ -2119,13 +2243,20 @@
       error.textContent = "请先写下一个具体的小愿望。";
       return;
     }
-    if (cloudSession) {
-      const response = await sendCommand("create_wish", { text });
-      if (response) {
-        $("#wish-text").value = "";
-        renderStars();
-        showToast("已使用 1 颗 Star 发出愿望");
-        return;
+    const mode = writableSession();
+    if (!mode) return;
+    if (mode === "cloud") {
+      // 每次提交都会消耗一颗 Star，请求完成前不接受第二次提交。
+      submitButton.disabled = true;
+      try {
+        const response = await sendCommand("create_wish", { text });
+        if (response) {
+          if ($("#wish-text").value.trim() === text) $("#wish-text").value = "";
+          renderStars();
+          showToast("已使用 1 颗 Star 发出愿望");
+        }
+      } finally {
+        submitButton.disabled = false;
       }
       return;
     }
@@ -2135,6 +2266,7 @@
       return;
     }
     wallet.stars -= 1;
+    wallet.spentStars += 1;
     state.wishes.push({
       id: `wish-${Date.now()}`,
       roomId: currentRoomId(),
@@ -2195,24 +2327,17 @@
   async function handleImageUpload(input, kind) {
     const file = input.files && input.files[0];
     if (!file) return;
+    const mode = writableSession();
+    if (!mode) {
+      input.value = "";
+      return;
+    }
     let dataUrl = "";
     try {
       dataUrl = await fileToDataURL(file, kind === "avatar" ? 320 : 1600, kind === "avatar" ? 320 : 1000, kind === "avatar" ? 0.84 : 0.76);
-      if (cloudSession) {
-        const mediaEpoch = ++mutationEpoch;
-        activeMutations += 1;
-        let response;
-        try {
-          response = await apiRequest("/api/media", {
-            method: "POST",
-            body: JSON.stringify({ kind, dataUrl }),
-          });
-        } finally {
-          activeMutations = Math.max(0, activeMutations - 1);
-        }
-        if (mediaEpoch !== mutationEpoch) return;
-        mergeRemoteState(response.state, state.sessionRole);
-        persist();
+      if (mode === "cloud") {
+        const response = await sendMutation("/api/media", { kind, dataUrl });
+        if (!response.current) return;
         renderApp();
         showToast(kind === "avatar" ? "头像已更新" : "背景已更新");
         return;
@@ -2230,11 +2355,11 @@
       }
     } catch (error) {
       console.warn("Image upload failed", error);
-      if (cloudSession && error.status === 401) {
-        cloudSession = false;
-        stopRemoteRefresh();
+      if (error.status === 401) {
+        handleSessionExpired();
+        return;
       }
-      if (!cloudSession && canUseLocalFallback() && dataUrl) {
+      if (usesLocalData() && dataUrl) {
         if (kind === "avatar") state.roles[state.sessionRole].avatar = dataUrl;
         if (kind === "background") state.backgrounds[state.sessionRole] = dataUrl;
         persist();
@@ -2242,7 +2367,7 @@
         showToast(kind === "avatar" ? "头像已保存到本机" : "背景已保存到本机");
         return;
       }
-      showToast("图片处理失败，请换一张较小的图片");
+      showToast(error instanceof ApiError ? error.message : "图片处理失败，请换一张较小的图片");
     } finally {
       input.value = "";
     }
@@ -2258,10 +2383,15 @@
     });
     $("#logout-button").addEventListener("click", logout);
     $$('[data-view]').forEach((button) => button.addEventListener("click", () => navigate(button.dataset.view)));
-    $("#theme-toggle").addEventListener("click", toggleTheme);
-    $("#dialog-theme-toggle").addEventListener("click", toggleTheme);
-    $("#growth-text").addEventListener("input", (event) => { draft.growthText = event.target.value; draftRevision += 1; scheduleDraftSave(); });
-    $("#life-text").addEventListener("input", (event) => { draft.lifeText = event.target.value; draftRevision += 1; scheduleDraftSave(); });
+    $("#theme-toggle").addEventListener("click", toggleColorMode);
+    $$("#theme-style-options [data-theme-style]").forEach((button) => {
+      button.addEventListener("click", () => setThemeStyle(button.dataset.themeStyle));
+    });
+    $$("#color-mode-options [data-color-mode]").forEach((button) => {
+      button.addEventListener("click", () => setColorMode(button.dataset.colorMode));
+    });
+    $("#growth-text").addEventListener("input", (event) => handleEditorInput("growthText", event.target.value));
+    $("#life-text").addEventListener("input", (event) => handleEditorInput("lifeText", event.target.value));
     $$("#editor-mode-toggle button").forEach((button) => button.addEventListener("click", () => setEditorMode(button.dataset.mode)));
     $("#save-log").addEventListener("click", handleSaveToday);
     $("#checkin-notify").addEventListener("click", checkinAndNotify);
@@ -2288,18 +2418,18 @@
       $("#settings-dialog").close();
       logout();
     });
-    $("#clear-background").addEventListener("click", () => {
-      (async () => {
-        if (cloudSession) {
-          const response = await sendCommand("clear_background", {});
-          if (response) { applyBackground(); showToast("背景图已移除"); }
-          return;
-        }
-        state.backgrounds[state.sessionRole] = "";
-        persist();
-        applyBackground();
-        showToast("背景图已移除");
-      })();
+    $("#clear-background").addEventListener("click", async () => {
+      const mode = writableSession();
+      if (!mode) return;
+      if (mode === "cloud") {
+        const response = await sendCommand("clear_background", {});
+        if (response) { applyBackground(); showToast("背景图已移除"); }
+        return;
+      }
+      state.backgrounds[state.sessionRole] = "";
+      persist();
+      applyBackground();
+      showToast("背景图已移除");
     });
     $$("#timeline-filter button").forEach((button) => button.addEventListener("click", () => {
       timelineFilter = button.dataset.filter;
@@ -2358,19 +2488,17 @@
         $("#login-error").textContent = error.message || "共享空间暂时不可用，请稍后重试。";
       }
     }
+    // 回到页面时先检查日期，再在距离上次同步超过 1.5 秒时拉取远端状态。
+    const handleResume = () => {
+      const rolled = ensureEditorDate();
+      if (cloudSession && (rolled || Date.now() - lastRemoteRefreshAt > 1500)) {
+        refreshRemote({ silent: true });
+      }
+    };
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState !== "visible") return;
-      const rolled = ensureEditorDate();
-      if (cloudSession && (rolled || Date.now() - lastRemoteRefreshAt > 1500)) {
-        refreshRemote({ silent: true });
-      }
+      if (document.visibilityState === "visible") handleResume();
     });
-    window.addEventListener("focus", () => {
-      const rolled = ensureEditorDate();
-      if (cloudSession && (rolled || Date.now() - lastRemoteRefreshAt > 1500)) {
-        refreshRemote({ silent: true });
-      }
-    });
+    window.addEventListener("focus", handleResume);
     window.addEventListener("pageshow", (event) => {
       if (!event.persisted) return;
       ensureEditorDate();

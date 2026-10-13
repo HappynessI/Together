@@ -1,11 +1,27 @@
 <!doctype html>
-<html lang="zh-CN" data-theme="light">
+<html lang="zh-CN" data-style="solarized" data-mode="light">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#fdf6e3">
   <title>并肩 · 双人生活打卡</title>
-  <link rel="stylesheet" href="./styles.css?v=20260813-cross-day">
+  <script>
+    // 在样式生效前恢复本机保存的主题风格和明暗模式，避免首屏先闪一下默认主题。
+    // 存储键与取值规则和 app.js 中的 THEME_STYLE_STORE_KEY、STORE_KEY 保持一致；
+    // app.js 启动后会再次校验并接管。浏览器禁用本地存储时保留 HTML 上的默认值。
+    (function () {
+      var root = document.documentElement;
+      try {
+        var style = localStorage.getItem("pair-journal-theme-style-v1");
+        if (style === "paper" || style === "claude") root.dataset.style = style;
+        var saved = JSON.parse(localStorage.getItem("pair-journal-prototype-v5") || "null");
+        if (saved && saved.theme === "dark") root.dataset.mode = "dark";
+      } catch (error) {
+        // 本地存储不可用或内容损坏时什么都不做，app.js 会给出最终结果。
+      }
+    })();
+  </script>
+  <link rel="stylesheet" href="./styles.css?v=20261013-theme">
 </head>
 <body>
   <div id="ambient" aria-hidden="true"></div>
@@ -96,7 +112,7 @@
         <div class="topbar-actions">
           <button id="mobile-settings-button" type="button" class="mobile-profile-button" aria-label="打开个性设置"><span id="topbar-avatar" class="avatar"></span></button>
           <span id="today-label" class="date-chip"></span>
-          <button id="theme-toggle" type="button" class="icon-button" aria-label="切换明暗主题">◐</button>
+          <button id="theme-toggle" type="button" class="icon-button" aria-label="切换明暗模式" title="切换明暗模式">◐</button>
         </div>
       </header>
 
@@ -281,8 +297,19 @@
         <input id="background-image" type="file" accept="image/*" hidden>
       </div>
       <div class="setting-row">
-        <div><strong>Solarized 主题</strong><small>明亮纸张感或安静深色</small></div>
-        <button id="dialog-theme-toggle" type="button" class="secondary-button">切换明暗</button>
+        <div><strong>主题风格</strong><small id="theme-style-description">Solarized：暖色纸张与青色点缀</small></div>
+        <div id="theme-style-options" class="segmented-control setting-choice" role="radiogroup" aria-label="主题风格">
+          <button type="button" role="radio" data-theme-style="solarized" aria-checked="true">Solarized</button>
+          <button type="button" role="radio" data-theme-style="paper" aria-checked="false">素笺</button>
+          <button type="button" role="radio" data-theme-style="claude" aria-checked="false">Claude</button>
+        </div>
+      </div>
+      <div class="setting-row">
+        <div><strong>明暗模式</strong><small>两种风格都有明亮和深色；共享版会同步到你登录的其他设备</small></div>
+        <div id="color-mode-options" class="segmented-control setting-choice" role="radiogroup" aria-label="明暗模式">
+          <button type="button" role="radio" data-color-mode="light" aria-checked="true">明亮</button>
+          <button type="button" role="radio" data-color-mode="dark" aria-checked="false">深色</button>
+        </div>
       </div>
       <footer>
         <button id="clear-background" type="button" class="text-button">移除背景图</button>
@@ -304,6 +331,6 @@
   </dialog>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
-  <script src="./app.js?v=20260813-cross-day"></script>
+  <script src="./app.js?v=20261013-theme"></script>
 </body>
 </html>
